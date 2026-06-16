@@ -1,6 +1,12 @@
 import argparse
-import torch
 import os
+import warnings
+
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+warnings.filterwarnings("ignore")
+
+import torch
 import json
 import ray
 import time
@@ -8,6 +14,9 @@ import numpy as np
 from tqdm import tqdm
 import shortuuid
 import fasteners
+
+import transformers as _transformers
+_transformers.logging.set_verbosity_error()
 
 from transformers import AutoConfig
 from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
@@ -79,9 +88,7 @@ def preprocess_qwen(sources, tokenizer: transformers.PreTrainedTokenizer, has_im
     targets = torch.tensor(targets, dtype=torch.long)
     return input_ids
 
-@ray.remote(num_gpus=1)
-def eval_model(questions, args):
-    
+def _eval_model_impl(questions, args):
     # Model
     disable_torch_init()
     model_path = os.path.expanduser(args.model_path)
@@ -127,7 +134,10 @@ def eval_model(questions, args):
     
     n_correct = 0
     inference_time = []
-    for line in tqdm(questions):
+    vram_peaks_gb = []
+    pbar = tqdm(questions)
+    for line in pbar:
+        torch.cuda.reset_peak_memory_stats()
         idx = line["id"]
         question_type = line["metadata"]["question_type"]
         dataset_name = line["metadata"]["dataset"]
@@ -170,6 +180,11 @@ def eval_model(questions, args):
 
         with torch.inference_mode():
             start_time = time.time()
+            # Seed RNG per-question so temp>0 sampling is reproducible across A/B runs.
+            # Without this, two runs with same args produce different outputs from RNG alone,
+            # masking any real PE-induced logit shift.
+            torch.manual_seed(42)
+            torch.cuda.manual_seed_all(42)
             output_ids = model.generate(
                 input_ids,
                 images=image_tensors,
@@ -205,9 +220,20 @@ def eval_model(questions, args):
             + "\n")
             ans_file.flush()
 
+        vram_peaks_gb.append(torch.cuda.max_memory_allocated() / 1024**3)
+        total_s = sum(inference_time)
+        pbar.set_postfix({
+            "avg_GB": f"{sum(vram_peaks_gb)/len(vram_peaks_gb):.2f}",
+            "avg_s/it": f"{total_s/len(inference_time):.2f}",
+            "total_s": f"{total_s:.1f}",
+        })
+
     ans_file.close()
 
     return inference_time
+
+
+eval_model = ray.remote(num_gpus=1)(_eval_model_impl)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -235,18 +261,30 @@ if __name__ == "__main__":
     with open(os.path.expanduser(args.question_file)) as f:
         questions = json.load(f)
 
+    if args.test_size < len(questions):
+        import random
+        random.seed(42)
+        total = len(questions)
+        questions = random.sample(questions, args.test_size)
+        print(f"Sampled {args.test_size} questions from {total}")
+
     if os.path.exists(args.answer_file):
         print(f"The {args.answer_file} already exists!!!")
         exit()
-    
-    ray.init()
-    features = []
-    for i in range(args.n_gpu):
-        features.append(eval_model.remote(questions[i::args.n_gpu], args))
 
-    ret = ray.get(features)
-    inference_time = []
-    for item in ret:
-        inference_time.extend(item)
-    
+    if args.n_gpu == 1:
+        # Bypass ray so tqdm's carriage returns render cleanly in the terminal
+        # (ray captures worker stdout and re-emits each line with a (pid=...) prefix).
+        inference_time = _eval_model_impl(questions, args)
+    else:
+        ray.init()
+        features = []
+        for i in range(args.n_gpu):
+            features.append(eval_model.remote(questions[i::args.n_gpu], args))
+
+        ret = ray.get(features)
+        inference_time = []
+        for item in ret:
+            inference_time.extend(item)
+
     print(f"time: {np.mean(inference_time)}")
