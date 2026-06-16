@@ -10,6 +10,7 @@ import json
 from tqdm import tqdm
 import random
 import copy
+# from llava.voxelize import *   # disabled: nvblox_torch not installed; Exp 3 doesn't need voxelize
 
 def convert_from_uvd(u, v, d, intr, pose):
     # extr = np.linalg.inv(pose)
@@ -35,6 +36,10 @@ def load_matrix_from_txt(path, shape=(4, 4)):
     return np.array(matrix).reshape(shape)
 
 
+'''
+Takes 3d point clouds from camera frame to world frame
+(3d point cloud is crated from cam intrinsics)
+'''
 def unproject(intrinsics, poses, depths):
     """
         intrinsics: (V, 4, 4)
@@ -66,6 +71,14 @@ def unproject(intrinsics, poses, depths):
     world_coords = world_coords.view(V, H, W, 3)
 
     return world_coords
+
+'''Convert world coords into voxels'''
+def create_voxels():
+    pass
+
+'''Average depth (made for a patch)'''
+def calc_av_depth(depths):
+    return np.mean(depths)
 
 
 class VideoProcessor:
@@ -235,6 +248,7 @@ class VideoProcessor:
         
         return {
             "world_coords": world_coords,
+            "poses": poses,
         }
 
             
@@ -319,6 +333,7 @@ class VideoProcessor:
         return {
             "images": images,
             "world_coords": torch.from_numpy(np.stack(resized_coords)),
+            "poses": video_dict["poses"],
             "video_size": len(images),
             "boundry": boundry,
             "objects": torch.tensor(self.scan2obj[video_id]),
@@ -362,7 +377,7 @@ def merge_video_dict(video_dict_list):
     new_video_dict = {}
     new_video_dict['box_input'] = []
     for k in video_dict_list[0]:
-        if k in ["world_coords", 'images', 'objects']:
+        if k in ["world_coords", 'images', 'objects', 'poses']:
             new_video_dict[k] = torch.stack([video_dict[k] for video_dict in video_dict_list])
         elif k in ['box_input']:
             for video_dict in video_dict_list:

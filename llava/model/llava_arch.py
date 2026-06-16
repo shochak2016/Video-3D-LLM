@@ -222,6 +222,113 @@ class LlavaMetaForCausalLM(ABC):
 
         return world_coords_avg
 
+    
+    '''
+    Per-pixel distance from each frame's camera origin.
+    '''
+    def cam_distance(self, world_coords, pose_c2w):
+
+        cam_origin = pose_c2w[:, :3, 3]                                       # (V, 3)
+        return (world_coords - cam_origin[:, None, None, :]).norm(dim=-1)     # (V, H, W)
+    
+    def average_depth_in_patch(self, world_coords, pose_c2w, patch_size=27):
+        V = world_coords.size(0)
+
+        '''
+        T_w_c = torch.linalg.inv(pose_c2w)     # inverse for pose per frame, (V, 4, 4)                         
+        ones = torch.ones_like(world_coords[..., :1])
+        P_w_h = torch.cat([world_coords, ones], dim=-1)                      # (V, H, W, 4)
+        P_cam = torch.einsum('vij,vhwj->vhwi', T_w_c, P_w_h)                 # (V, H, W, 4) one batched matmul w einsum
+        '''
+
+        cam_dist = self.cam_distance(world_coords, pose_c2w)
+        cam_dist = cam_dist[:, :-6, :-6]                                     # (V, 378, 378), divisible
+        return torch.nn.functional.avg_pool2d(
+            cam_dist, kernel_size=patch_size, stride=patch_size              # (V, 14, 14)
+        )
+
+    '''
+    1. compute average depth for each patch
+    2. assign pixel to patch with closest average depth value (nearest 8 patches)
+    3. compute centroid of new "patches"
+    '''
+    def average_coordinate_in_patch_correction(self, world_coords, pose_c2w, patch_size=27):
+        V = world_coords.size(0)
+        K = patch_size                                                              # 27
+        G = 14                                                                      # 378 / 27
+
+        # per-pixel signals, cropped to (V, 378, 378)
+        d = self.cam_distance(world_coords, pose_c2w)[:, :-6, :-6]                  # (V, 378, 378) cam-distance
+        p = world_coords[:, :-6, :-6, :]                                            # (V, 378, 378, 3) world XYZ
+
+        # 1. avg cam-depth per patch + initial centroid (fallback for empty patches)
+        patch_depths = torch.nn.functional.avg_pool2d(
+            d, kernel_size=K, stride=K
+        )                                                                           # (V, G, G)
+        init_c = torch.nn.functional.avg_pool2d(
+            p.permute(0, 3, 1, 2), kernel_size=K, stride=K
+        ).permute(0, 2, 3, 1)                                                       # (V, G, G, 3)
+
+        # 2. assign pixel to patch with closest average depth value (nearest 8 patches)
+        # 9 neighbor avg-depths per patch (self + 8); out-of-bounds = +inf (never wins argmin)
+        pad_d = torch.nn.functional.pad(patch_depths, (1, 1, 1, 1), mode='constant', value=float('inf'))  #padding patches w/infinite depth for edges (V, G+2, G+2)
+
+        neighbors_depth = torch.stack(
+            [pad_d[:, i:i+G, j:j+G] for i in range(3) for j in range(3)],
+            dim=-1,
+        ) # (V, G, G, 9)
+
+        #knn step
+        c9 = neighbors_depth.repeat_interleave(K, dim=1).repeat_interleave(K, dim=2)        #lookup table for each pixel (V, 378, 378, 9)
+        diff = (d.unsqueeze(-1) - c9).abs()                                        # (V, 378, 378, 9)
+        winner = diff.argmin(dim=-1)                                               # (V, 378, 378)  in [0..8]
+
+        # decode which patch and home patch
+        di = winner // 3 - 1
+        dj = winner %  3 - 1
+        pix_i = torch.arange(378, device=d.device) // K                            # (378,) home patch row of each pixel
+        pix_j = torch.arange(378, device=d.device) // K                            # (378,) home patch col of each pixel
+        gi = (pix_i.view(1, -1, 1) + di).clamp(0, G - 1)
+        gj = (pix_j.view(1, 1, -1) + dj).clamp(0, G - 1)
+        flat_target = (gi * G + gj).reshape(V, -1)                                      # (V, 378*378)
+
+        # move pixels into target patches, recompute centroid, vectorized
+        flat_p = p.reshape(V, -1, 3)
+        sums = torch.zeros(V, G * G, 3, device=p.device, dtype=p.dtype)
+        cnts = torch.zeros(V, G * G,    device=p.device, dtype=p.dtype)
+        sums.scatter_add_(1, flat_target.unsqueeze(-1).expand(-1, -1, 3), flat_p)
+        cnts.scatter_add_(1, flat_target, torch.ones_like(flat_target, dtype=p.dtype))
+        new_c = (sums / cnts.clamp_min(1).unsqueeze(-1)).view(V, G, G, 3)
+
+        # empty patches keep their original centroid
+        empty = (cnts.view(V, G, G) == 0).unsqueeze(-1)
+
+        final = torch.where(empty, init_c, new_c)
+
+        if not getattr(self, '_exp3_diff_printed', False):
+            # pixel-level: how many actually picked a non-self neighbor (winner != 4)
+            reassigned = (winner != 4)
+            pix_reassigned_frac = reassigned.float().mean().item()
+            # patch-level: how many patches lost any home pixel
+            home_lost = reassigned.view(V, G, K, G, K).any(dim=4).any(dim=2)   # (V, G, G)
+            patch_donated_frac = home_lost.float().mean().item()
+            # patch-level: centroid moved (the original metric)
+            diff = (final - init_c).norm(dim=-1)
+            nonzero = diff > 1e-6
+            changed_frac = nonzero.float().mean().item()
+            median_disp = diff[nonzero].median().item() if nonzero.any() else 0.0
+            max_disp = diff.max().item()
+            empty_frac = empty.float().mean().item()
+            print(f"[exp3] pixels reassigned: {100*pix_reassigned_frac:.1f}%  "
+                  f"patches that lost any pixel: {100*patch_donated_frac:.1f}%  "
+                  f"patches with moved centroid: {100*changed_frac:.1f}%  "
+                  f"empty: {100*empty_frac:.1f}%  "
+                  f"disp median={median_disp*100:.2f}cm max={max_disp*100:.2f}cm", flush=True)
+            self._exp3_diff_printed = True
+
+        return final
+
+
     def minmax_coordinate_in_patch(self, world_coords, patch_size=27):
 
         V, H, W, D = world_coords.size() # D = 3
@@ -333,7 +440,7 @@ class LlavaMetaForCausalLM(ABC):
         image_feature = image_feature.permute(1, 2, 0).contiguous()
         return image_feature
 
-    def prepare_inputs_labels_for_multimodal(
+    def prepare_inputs_labels_for_multimodal( #focus
         self, 
         input_ids, 
         position_ids, 
@@ -392,6 +499,9 @@ class LlavaMetaForCausalLM(ABC):
                 box_input = None
 
             n_points = 1
+            if not getattr(self, '_pe_debug_printed', False):
+                print(f"[dispatch] world_position_embedding_type = {self.config.world_position_embedding_type!r}", flush=True)
+                self._pe_debug_printed = True
             if 'avg' in self.config.world_position_embedding_type:
                 world_coords = [self.average_coordinate_in_patch(coords) for coords in world_coords]
             elif "sample9" in self.config.world_position_embedding_type:
@@ -405,6 +515,9 @@ class LlavaMetaForCausalLM(ABC):
             elif "minmax" in self.config.world_position_embedding_type:
                 world_coords = [self.minmax_coordinate_in_patch(coords) for coords in world_coords]
                 n_points = 2
+            elif "exp3" in self.config.world_position_embedding_type:
+                    poses = video_dict['poses']
+                    world_coords = [self.average_coordinate_in_patch_correction(coords, pose) for coords, pose in zip(world_coords, poses)]
 
             if n_points > 1:
                 if box_input is not None:
@@ -512,7 +625,21 @@ class LlavaMetaForCausalLM(ABC):
                         coords = world_coords[idx].flatten(1, 2)
                         
 
-                    image_feat = image_feat + self.get_model().world_position_embedding(coords.detach())
+                    pe = self.get_model().world_position_embedding(coords.detach())
+                    if not getattr(self, '_pe_mag_printed', False):
+                        feat_n = image_feat.norm(dim=-1)
+                        pe_n   = pe.norm(dim=-1)
+                        sum_n  = (image_feat + pe).norm(dim=-1)
+                        # cosine between pe and feat -- how aligned the addition is
+                        cos = ((image_feat * pe).sum(-1) /
+                               (feat_n.clamp_min(1e-8) * pe_n.clamp_min(1e-8))).mean().item()
+                        print(f"[pe_check] feat_norm={feat_n.mean().item():.3f}  "
+                              f"pe_norm={pe_n.mean().item():.3f}  "
+                              f"sum_norm={sum_n.mean().item():.3f}  "
+                              f"ratio(pe/feat)={(pe_n.mean()/feat_n.mean().clamp_min(1e-8)).item():.4f}  "
+                              f"cos(feat,pe)={cos:.4f}", flush=True)
+                        self._pe_mag_printed = True
+                    image_feat = image_feat + pe
                     new_image_features.append(image_feat)
                 image_features = new_image_features
 
