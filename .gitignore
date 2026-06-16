@@ -7,10 +7,10 @@
 .venv*/
 .env
 
-# Large data and weights -- never commit
-data/
-ckpt/
-results/
+# Large data and weights -- never commit (anchored to repo root so scripts/3d/data is preserved)
+/data/
+/ckpt/
+/results/
 
 # Experiment outputs
 *.log
