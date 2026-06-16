@@ -1,0 +1,14 @@
+# Registry: maps (pe, coord) -> a checkpoint under ckpt/.
+# Add an entry per checkpoint you've trained/downloaded.
+#
+# pe:    none | mlp | sinusoidal
+# coord: center | minmax | average
+#
+# `world_position_embedding_type` is the substring-encoded value baked into
+# the checkpoint's config.json. The wrapper checks this matches before running.
+
+checkpoints:
+  - pe: sinusoidal
+    coord: average
+    name: llava_qwen_scanqa_init_res
+    world_position_embedding_type: avg-discrete-sin3d

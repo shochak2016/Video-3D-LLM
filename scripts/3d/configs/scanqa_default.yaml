@@ -1,0 +1,6 @@
+task: scanqa                  # scanqa | sqa3d
+frame_sampling_rate: 32       # int, --max_frame_num
+sampling_strategy: uniform    # uniform | mc-ratio90 | mc-ratio95
+pe: sinusoidal                # none | mlp | sinusoidal
+coord: average                # center | minmax | average
+test_size: 50                 # optional; omit to run all questions
