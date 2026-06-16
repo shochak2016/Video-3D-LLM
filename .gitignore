@@ -1,1 +1,25 @@
+# Python build / cache
 *__pycache__*
+*.egg-info/
+*.pyc
+
+# Virtual environments
+.venv*/
+.env
+
+# Large data and weights -- never commit
+data/
+ckpt/
+results/
+
+# Experiment outputs
+*.log
+
+# Stray file from a Python `>` redirect that wrote str(file) as a dirname
+<_io.TextIOWrapper *
+
+# Editor / OS cruft
+.DS_Store
+.idea/
+.vscode/
+*.swp
