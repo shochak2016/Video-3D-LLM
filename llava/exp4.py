@@ -1,9 +1,11 @@
 # llava/exp4.py
-from nvblox_torch.mapper import Mapper, QueryType
-from nvblox_torch.projective_integrator_types import ProjectiveIntegratorType
-from nvblox_torch.sensor import Sensor
+# NOTE: nvblox_torch is imported LAZILY inside the clustering functions only.
+# Importing it at module load initializes a CUDA context, which deadlocks a
+# forked DataLoader worker. The per-step cache-hit path (assemble_crop_pixels)
+# must stay nvblox/CUDA-free so workers>0 works.
 from sklearn.cluster import DBSCAN
 import torch, numpy as np
+import torch.nn.functional as F
 
 from typing import List, Optional, Tuple
 
@@ -15,9 +17,7 @@ DROP_PX = SIGLIP_INPUT - GRID * PATCH_PIX            # = 6, trailing pixels that
 
 # ── data container ────────────────────────────────────────────────
 class VoxelClusters:
-    # (the same class from blocks 6-12: __init__, cluster_ids, _mask,
-    #  cluster_voxels, _linearize, cluster_voxel_keys, cluster_bbox_2d)
-        """
+    """
     Result of clustering one scene's surface voxels. Read-only after construction.
     Exposes only what the downstream Exp 4 pipeline needs:
       - cluster_ids        : list of cluster ids (excludes noise -1)
@@ -123,31 +123,10 @@ class VoxelClusters:
         y1 = min(H, int(v.max().item()) + 1 + pad)
         return None if (x1 <= x0 or y1 <= y0) else (x0, y0, x1, y1)
 
-# ── one-shot pipeline ─────────────────────────────────────────────
-def cluster_scene(
-    depths, poses_c2w, intrinsics, world_coords,
-    rgb_frames=None,
-    voxel_size=0.1, surface_thresh=None,
-    eps=0.15, min_samples=5, use_rgb=False, rgb_weight=0.05,
-) -> VoxelClusters:
-    """
-    Build per-scene nvblox TSDF, snap candidates to voxel grid, TSDF-filter,
-    DBSCAN. Returns VoxelClusters.
-    """
-    mapper = Mapper(voxel_size, ProjectiveIntegratorType.TSDF)
-    H, W = depths.shape[-2:]
-    sensor = _make_sensor(intrinsics, W, H)
-    for v in range(depths.shape[0]):
-        t_w_c = poses_c2w[v].cpu().float().contiguous()
-        mapper.add_depth_frame(depths[v].cuda().float().contiguous(), t_w_c, sensor)
-        if rgb_frames is not None:
-            mapper.add_color_frame(rgb_frames[v].cuda().contiguous(), t_w_c, sensor)
-    return _cluster_via_mapper(mapper, world_coords, rgb_frames, voxel_size,
-                                surface_thresh, eps, min_samples, use_rgb, rgb_weight)
-
-# (plus _make_sensor and _cluster_via_mapper as small free helpers)
-def _make_sensor(intr, width: int, height: int) -> Sensor:
+# ── small free helpers ────────────────────────────────────────────
+def _make_sensor(intr, width: int, height: int):
     """Build an nvblox Sensor from (fx,fy,cx,cy) tuple, 3x3, or 4x4 intrinsics."""
+    from nvblox_torch.sensor import Sensor  # lazy: avoids CUDA init at import time
     if isinstance(intr, (tuple, list)) and len(intr) == 4:
         fx, fy, cx, cy = (float(x) for x in intr)
     else:
@@ -180,6 +159,8 @@ def cluster_scene(
     single-frame voxels get filtered out. Using the multi-view TSDF as a gate
     gives much cleaner clusters than raw per-frame voxel hashing.
     """
+    from nvblox_torch.mapper import Mapper, QueryType  # lazy: keep CUDA init out of import
+    from nvblox_torch.projective_integrator_types import ProjectiveIntegratorType
     V, H, W = depths_m.shape
     mapper = Mapper(voxel_size, ProjectiveIntegratorType.TSDF)
     sensor = _make_sensor(intrinsics, W, H)
@@ -433,3 +414,230 @@ def build_crop_tokens(
         "centroid":     torch.stack(c_cents, dim=0),                        # (N, 3)
     }
 
+
+
+# ── scene-level entry point (used by VideoProcessor) ──────────────
+@torch.no_grad()
+def build_scene_crops(
+    depths_m: torch.Tensor,        # (V, H, W) float METRES (0 = invalid)
+    poses_c2w: torch.Tensor,       # (V, 4, 4) axis-aligned camera->world
+    intrinsics: torch.Tensor,      # (3, 3) or (4, 4) depth-camera intrinsics
+    world_coords: torch.Tensor,    # (V, H, W, 3) axis-aligned, == unproject(depths_m)
+    rgb_frames: torch.Tensor,      # (V, H, W, 3) uint8, depth resolution
+    voxel_size: float = 0.1,
+    eps: float = 0.15,
+    min_samples: int = 5,
+    use_rgb: bool = False,
+    rgb_weight: float = 0.05,
+    pad: int = 4,
+    bbox_min_side: int = 16,
+    top_k_per_frame: Optional[int] = 2,
+    max_crops: Optional[int] = 24,
+    siglip_mean: Tuple[float, float, float] = (0.5, 0.5, 0.5),
+    siglip_std:  Tuple[float, float, float] = (0.5, 0.5, 0.5),
+) -> dict:
+    """
+    One-call Exp 4 scene -> crop tokens, with a global crop budget.
+
+    Runs the nvblox TSDF + DBSCAN clustering then builds per-(cluster, frame)
+    crops. `top_k_per_frame` caps crops per frame; `max_crops` caps the scene
+    total (the most-populated crops -- highest cluster-pixel coverage -- win,
+    keeping the visual-token count bounded for the LLM).
+
+    Returns the same dict as build_crop_tokens (N <= max_crops).
+    """
+    clusters = cluster_scene(
+        depths_m, poses_c2w, intrinsics, world_coords,
+        rgb_frames=rgb_frames, voxel_size=voxel_size,
+        eps=eps, min_samples=min_samples, use_rgb=use_rgb, rgb_weight=rgb_weight,
+    )
+    out = build_crop_tokens(
+        world_coords, rgb_frames, poses_c2w, intrinsics, clusters,
+        pad=pad, bbox_min_side=bbox_min_side, top_k_per_frame=top_k_per_frame,
+        siglip_mean=siglip_mean, siglip_std=siglip_std,
+    )
+    n = out["pixel_values"].shape[0]
+    if max_crops is not None and n > max_crops:
+        # Keep the crops with the most cluster-pixel coverage (most informative).
+        coverage = out["patch_valid"].flatten(1).sum(dim=1)                # (N,)
+        keep = torch.topk(coverage, max_crops).indices
+        keep = keep[torch.argsort(keep)]                                   # stable order
+        out = {k: v[keep] for k, v in out.items()}
+    return out
+
+
+# ── split pipeline: cache the GPU clustering geometry, rebuild pixels on CPU ──
+# Caching the final crop pixels is ~42 MB/scene (24 crops * 3*384*384 f32) ->
+# 100s of GB across all scene/sampling combos. Instead we cache only the
+# clustering GEOMETRY (bboxes + per-patch coords, ~50 KB/scene) -- the expensive
+# nvblox+DBSCAN part -- and rebuild the RGB crop pixels per step on CPU (cheap,
+# DataLoader-worker-safe, no CUDA). This is what lets training use workers>0.
+
+def _ang_dist(a: float, b: float) -> float:
+    """Smallest absolute angular difference on a circle, in [0, pi]."""
+    d = abs(a - b) % (2 * np.pi)
+    return min(d, 2 * np.pi - d)
+
+
+@torch.no_grad()
+def compute_crop_geometry(
+    world_coords: torch.Tensor,    # (V, H, W, 3)
+    poses_c2w: torch.Tensor,       # (V, 4, 4)
+    intrinsics: torch.Tensor,      # (3,3) or (4,4)
+    clusters: VoxelClusters,
+    pad: int = 4,
+    bbox_min_side: int = 16,
+    top_k_per_frame: Optional[int] = 2,
+    view_select: str = "area",     # "area" (per-frame top-k by bbox area) | "angular"
+    n_views_per_cluster: int = 3,  # angular: max diverse views kept per cluster
+    max_crops: Optional[int] = None,  # angular: global budget (rank-round-robin across clusters)
+) -> dict:
+    """Per-crop bbox + per-patch coords/validity (NO pixels). Cacheable + tiny.
+
+    view_select:
+      - "area": original -- per frame, keep the top_k largest-bbox clusters. A static
+        object is re-cropped from many frames (redundant near-duplicate views).
+      - "angular": per cluster, keep up to n_views_per_cluster views that MAXIMIZE
+        azimuth spread about the object centroid (farthest-point on the viewing
+        circle, seeded by largest bbox), then fill the global max_crops budget
+        round-robin by view-rank (every cluster gets its primary view before any
+        gets a 2nd/3rd). Kills multi-view redundancy, guarantees angular coverage,
+        encoder-agnostic -> carries verbatim to SigLIP2.
+    """
+    V, H, W, _ = world_coords.shape
+    device = world_coords.device
+    cluster_ids = clusters.cluster_ids
+    centroids = {cid: clusters.cluster_voxels(cid)[0].mean(dim=0).to(device) for cid in cluster_ids}
+    voxel_keys = {cid: clusters.cluster_voxel_keys(cid).to(device) for cid in cluster_ids}
+    voxel_size = clusters.voxel_size
+    origin = clusters.origin.to(device)
+
+    # ---- choose which (cluster, frame, bbox) crops to keep ----
+    selected = []  # list of (cid, v, bbox)
+    if view_select == "angular":
+        cand = {cid: [] for cid in cluster_ids}        # cid -> [(v, bbox, area)]
+        for v in range(V):
+            for cid in cluster_ids:
+                bbox = clusters.cluster_bbox_2d(cid, poses_c2w[v], intrinsics, (H, W), pad=pad)
+                if bbox is None:
+                    continue
+                x0, y0, x1, y1 = bbox
+                if (x1 - x0) < bbox_min_side or (y1 - y0) < bbox_min_side:
+                    continue
+                cand[cid].append((v, bbox, (x1 - x0) * (y1 - y0)))
+        ranked = []  # (rank, area, cid, v, bbox)
+        for cid in cluster_ids:
+            c = cand[cid]
+            if not c:
+                continue
+            cen = centroids[cid]
+            az = []
+            for (v, bbox, area) in c:
+                d = poses_c2w[v][:3, 3].to(cen.device, cen.dtype) - cen   # camera - centroid
+                az.append(float(torch.atan2(d[1], d[0])))                # azimuth (z up, axis-aligned)
+            chosen = [max(range(len(c)), key=lambda i: c[i][2])]         # seed: largest bbox
+            while len(chosen) < min(n_views_per_cluster, len(c)):
+                best_i, best_d = None, -1.0
+                for i in range(len(c)):
+                    if i in chosen:
+                        continue
+                    md = min(_ang_dist(az[i], az[j]) for j in chosen)     # nearest already-chosen angle
+                    if md > best_d:
+                        best_d, best_i = md, i
+                chosen.append(best_i)
+            for rank, i in enumerate(chosen):
+                ranked.append((rank, c[i][2], cid, c[i][0], c[i][1]))
+        ranked.sort(key=lambda r: (r[0], -r[1]))   # all primaries (by area), then secondaries, ...
+        if max_crops is not None:
+            ranked = ranked[:max_crops]
+        selected = [(cid, v, bbox) for (_, _, cid, v, bbox) in ranked]
+    else:  # "area"
+        for v in range(V):
+            frame_crops = []
+            for cid in cluster_ids:
+                bbox = clusters.cluster_bbox_2d(cid, poses_c2w[v], intrinsics, (H, W), pad=pad)
+                if bbox is None:
+                    continue
+                x0, y0, x1, y1 = bbox
+                if (x1 - x0) < bbox_min_side or (y1 - y0) < bbox_min_side:
+                    continue
+                frame_crops.append((cid, bbox, (x1 - x0) * (y1 - y0)))
+            if top_k_per_frame is not None:
+                frame_crops.sort(key=lambda x: -x[2])
+                frame_crops = frame_crops[:top_k_per_frame]
+            for cid, bbox, _ in frame_crops:
+                selected.append((cid, v, bbox))
+
+    # ---- build geometry for the selected crops ----
+    bboxes, p_coords, p_valid, f_ids = [], [], [], []
+    for cid, v, bbox in selected:
+        wc_crop = _crop_and_resize_coords(world_coords[v], bbox)
+        pc, pv = _per_patch_coord(wc_crop, voxel_keys[cid], voxel_size, origin, centroids[cid])
+        bboxes.append(torch.tensor(bbox, dtype=torch.long, device=device))
+        p_coords.append(pc)
+        p_valid.append(pv)
+        f_ids.append(v)
+
+    if not bboxes:
+        return {"bboxes": torch.empty(0, 4, dtype=torch.long),
+                "patch_coords": torch.empty(0, GRID, GRID, 3),
+                "patch_valid": torch.empty(0, GRID, GRID, dtype=torch.bool),
+                "frame_id": torch.empty(0, dtype=torch.long),
+                "img_shape": torch.tensor([H, W], dtype=torch.long)}
+    return {"bboxes": torch.stack(bboxes),
+            "patch_coords": torch.stack(p_coords),
+            "patch_valid": torch.stack(p_valid),
+            "frame_id": torch.tensor(f_ids, dtype=torch.long, device=device),
+            "img_shape": torch.tensor([H, W], dtype=torch.long)}
+
+
+@torch.no_grad()
+def build_scene_geometry(
+    depths_m, poses_c2w, intrinsics, world_coords,
+    voxel_size=0.1, eps=0.15, min_samples=5, use_rgb=False, rgb_weight=0.05,
+    pad=4, bbox_min_side=16, top_k_per_frame=2, max_crops=24,
+    view_select="area", n_views_per_cluster=3,
+) -> dict:
+    """Cluster (GPU) -> crop geometry, with a global crop budget. Cacheable."""
+    clusters = cluster_scene(
+        depths_m, poses_c2w, intrinsics, world_coords,
+        rgb_frames=None, voxel_size=voxel_size, eps=eps,
+        min_samples=min_samples, use_rgb=use_rgb, rgb_weight=rgb_weight,
+    )
+    geo = compute_crop_geometry(world_coords, poses_c2w, intrinsics, clusters,
+                                pad=pad, bbox_min_side=bbox_min_side, top_k_per_frame=top_k_per_frame,
+                                view_select=view_select, n_views_per_cluster=n_views_per_cluster,
+                                max_crops=max_crops)
+    n = geo["bboxes"].shape[0]
+    # "angular" already budgets to max_crops by rank inside compute_crop_geometry;
+    # only the "area" path needs the coverage-based global cap.
+    if view_select != "angular" and max_crops is not None and n > max_crops:
+        coverage = geo["patch_valid"].flatten(1).sum(dim=1)
+        keep = torch.topk(coverage, max_crops).indices
+        keep = keep[torch.argsort(keep)]
+        for k in ("bboxes", "patch_coords", "patch_valid", "frame_id"):
+            geo[k] = geo[k][keep]
+    return geo
+
+
+@torch.no_grad()
+def assemble_crop_pixels(
+    rgb_frames: torch.Tensor,      # (V, H, W, 3) uint8, depth resolution
+    frame_id: torch.Tensor,        # (N,)
+    bboxes: torch.Tensor,          # (N, 4)
+    siglip_mean: Tuple[float, float, float] = (0.5, 0.5, 0.5),
+    siglip_std:  Tuple[float, float, float] = (0.5, 0.5, 0.5),
+) -> torch.Tensor:
+    """Rebuild SigLIP-normalized crop pixels from cached geometry. CPU-safe."""
+    device = rgb_frames.device
+    if frame_id.numel() == 0:
+        return torch.empty(0, 3, SIGLIP_INPUT, SIGLIP_INPUT, device=device)
+    mean = torch.tensor(siglip_mean, device=device).view(3, 1, 1)
+    std = torch.tensor(siglip_std, device=device).view(3, 1, 1)
+    out = []
+    for i in range(frame_id.shape[0]):
+        v = int(frame_id[i].item())
+        bbox = tuple(int(x) for x in bboxes[i].tolist())
+        crop = _crop_and_resize_rgb(rgb_frames[v], bbox)     # (3,384,384) in [0,1]
+        out.append((crop - mean) / std)
+    return torch.stack(out, dim=0)

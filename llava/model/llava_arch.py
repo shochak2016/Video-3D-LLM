@@ -54,6 +54,11 @@ class LlavaMetaModel:
                 n_points = 5
             elif "minmax" in self.config.world_position_embedding_type:
                 n_points = 2
+            elif "exp4" in self.config.world_position_embedding_type:
+                # Exp 4 randomizes avg<->minmax per sample; both feed 2 points
+                # ([c,c] / [min,max]) through one fixed sin3d module, and crop
+                # patches feed [c,c]. So the module is built with n_points=2.
+                n_points = 2
             else:
                 n_points = 1
         
@@ -488,21 +493,32 @@ class LlavaMetaForCausalLM(ABC):
         use_mrope_position_embedding = False
         use_sin3d_pe = False
         use_mlp_pe = False
+        is_exp4 = False
         if hasattr(self.config, 'world_position_embedding_type') and past_key_values is None:
             B = input_ids.shape[0]
             world_coords = video_dict['world_coords']
             xyz_min = world_coords.view(B, -1, 3).min(dim=1)[0]
 
-            if len(video_dict['box_input']):
-                box_input = video_dict['box_input']     # [1, 3]
-            else:
-                box_input = None
+            # box_input is now a per-sample list (one (1,3) tensor or None each);
+            # its coord-token PE is applied per batch_idx in the token loop below,
+            # so nothing batch-wide is needed here.
+            box_input = None
 
             n_points = 1
+            # Exp 4: voxel-cluster crop tokens augment the uniform frames. The
+            # uniform-frame coord reduction is handled per-sample in the image
+            # feature loop (randomized avg/minmax), so we skip it here, but still
+            # run the box/object PE prep with n_points=2.
+            is_exp4 = ('exp4' in self.config.world_position_embedding_type
+                       and video_dict is not None and 'exp4_pixel_values' in video_dict)
+            if is_exp4:
+                n_points = 2
             if not getattr(self, '_pe_debug_printed', False):
-                print(f"[dispatch] world_position_embedding_type = {self.config.world_position_embedding_type!r}", flush=True)
+                print(f"[dispatch] world_position_embedding_type = {self.config.world_position_embedding_type!r} is_exp4={is_exp4}", flush=True)
                 self._pe_debug_printed = True
-            if 'avg' in self.config.world_position_embedding_type:
+            if is_exp4:
+                pass  # uniform coord reduction done per-sample below
+            elif 'avg' in self.config.world_position_embedding_type:
                 world_coords = [self.average_coordinate_in_patch(coords) for coords in world_coords]
             elif "sample9" in self.config.world_position_embedding_type:
                 world_coords = [self.sample_n_points(coords, n_points=9) for coords in world_coords]
@@ -526,7 +542,8 @@ class LlavaMetaForCausalLM(ABC):
                     object_boxes_center = object_boxes_center[:, None, :].repeat(1, n_points, 1)
 
             if 'discrete' in self.config.world_position_embedding_type or use_mrope_position_embedding:
-                world_coords_discrete = [self.discrete_coords(coords, xyz_min[i]) for i, coords in enumerate(world_coords)]
+                if not is_exp4:
+                    world_coords_discrete = [self.discrete_coords(coords, xyz_min[i]) for i, coords in enumerate(world_coords)]
                 if box_input is not None:
                     box_input = self.discrete_coords(box_input, None)
                 if object_boxes is not None:
@@ -616,14 +633,50 @@ class LlavaMetaForCausalLM(ABC):
                 object_features =  None
 
             
-            if use_sin3d_pe or use_mlp_pe:
+            if is_exp4:
+                # Exp 4 (augment): add per-sample uniform-frame PE (randomized
+                # avg/minmax -> 2 points), then append voxel-cluster crop tokens
+                # (each a 14x14 grid) as extra "frames" with their own sin3d PE.
+                dev = image_features[0].device
+                wpe = self.get_model().world_position_embedding
+                pe_red = video_dict.get('pe_reduction', None)
+                discrete = 'discrete' in self.config.world_position_embedding_type
+                new_image_features = []
+                for idx, uf in enumerate(image_features):
+                    wc = video_dict['world_coords'][idx].to(dev)               # (V,384,384,3)
+                    red = pe_red[idx] if (pe_red is not None and idx < len(pe_red)) else None
+                    if red == 'minmax':
+                        c2 = self.minmax_coordinate_in_patch(wc)               # (V,14,14,2,3)
+                    else:
+                        c1 = self.average_coordinate_in_patch(wc)             # (V,14,14,3)
+                        c2 = torch.stack([c1, c1], dim=3)                      # (V,14,14,2,3)
+                    if discrete:
+                        c2 = self.discrete_coords(c2, None)
+                    upe = wpe(c2.flatten(1, 2).detach())                       # (V,196,hidden)
+                    uf = uf + upe.to(uf.dtype)
+
+                    crops = video_dict['exp4_pixel_values'][idx]
+                    if crops is not None and crops.shape[0] > 0:
+                        crops = crops.to(device=dev, dtype=uf.dtype)
+                        cf = self.get_2dPool(self.encode_images(crops))        # (N,196,hidden)
+                        pc = video_dict['exp4_patch_coords'][idx].to(dev)      # (N,14,14,3)
+                        pc2 = torch.stack([pc, pc], dim=3)                     # (N,14,14,2,3)
+                        if discrete:
+                            pc2 = self.discrete_coords(pc2, None)
+                        cpe = wpe(pc2.flatten(1, 2).detach())                  # (N,196,hidden)
+                        cf = cf + cpe.to(cf.dtype)
+                        uf = torch.cat([uf, cf], dim=0)                        # (V+N,196,hidden)
+                    new_image_features.append(uf)
+                image_features = new_image_features
+
+            if (use_sin3d_pe or use_mlp_pe) and not is_exp4:
                 new_image_features = []
                 for idx, image_feat in enumerate(image_features):
                     if "discrete" in self.config.world_position_embedding_type:
                         coords = world_coords_discrete[idx].flatten(1, 2)
                     else:
                         coords = world_coords[idx].flatten(1, 2)
-                        
+
 
                     pe = self.get_model().world_position_embedding(coords.detach())
                     if not getattr(self, '_pe_mag_printed', False):
@@ -820,11 +873,18 @@ class LlavaMetaForCausalLM(ABC):
             cat_cur_input_ids_noim = torch.cat(cur_input_ids_noim)
             cur_input_embeds = self.get_model().embed_tokens(cat_cur_input_ids_noim)
 
-            # Add input coord PE
+            # Add input coord PE -- per sample, from this sample's own box_input.
             if hasattr(self.config, "coord_token_ids") and (use_sin3d_pe or use_mlp_pe):
                 query_coord_tokens = (cat_cur_input_ids_noim == self.config.coord_token_ids[0])
-                if query_coord_tokens.sum() != 0:
-                    cur_input_embeds[query_coord_tokens] += self.get_model().world_position_embedding(box_input.unsqueeze(0).detach())[:, 0]
+                bi = video_dict['box_input'][batch_idx] if video_dict is not None else None
+                if query_coord_tokens.sum() != 0 and bi is not None:
+                    bi = bi.to(cur_input_embeds.device)
+                    if 'discrete' in self.config.world_position_embedding_type:
+                        bi = self.discrete_coords(bi, None)
+                    if n_points > 1:
+                        bi = bi[:, None, :].repeat(1, n_points, 1)          # (1, n_points, 3)
+                    pe = self.get_model().world_position_embedding(bi.unsqueeze(0).detach())[:, 0]
+                    cur_input_embeds[query_coord_tokens] += pe.to(cur_input_embeds.dtype)
 
             
             cur_input_embeds_no_im = torch.split(cur_input_embeds, split_sizes, dim=0)

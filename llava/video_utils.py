@@ -83,20 +83,42 @@ def calc_av_depth(depths):
 
 class VideoProcessor:
     def __init__(
-        self, 
-        video_folder="data", 
+        self,
+        video_folder="data",
         annotation_dir="data/embodiedscan/",
         voxel_size=None,
         min_xyz_range=None,
         max_xyz_range=None,
         frame_sampling_strategy='uniform',
         val_box_type='pred',
+        world_position_embedding_type=None,
     ):
         self.video_folder = video_folder
         self.voxel_size = voxel_size
         self.min_xyz_range = torch.tensor(min_xyz_range) if min_xyz_range is not None else None
         self.max_xyz_range = torch.tensor(max_xyz_range) if max_xyz_range is not None else None
         self.frame_sampling_strategy = frame_sampling_strategy
+        # Exp 4: nvblox voxel-cluster crop tokens. Enabled when the PE type string
+        # contains 'exp4'. Params are env-overridable so the launcher can tune the
+        # crop budget / clustering without code edits.
+        self.exp4_enabled = bool(world_position_embedding_type) and ('exp4' in world_position_embedding_type)
+        if self.exp4_enabled:
+            self.exp4_voxel_size = float(os.environ.get("EXP4_VOXEL_SIZE", 0.1))
+            self.exp4_eps = float(os.environ.get("EXP4_EPS", 0.15))
+            self.exp4_min_samples = int(os.environ.get("EXP4_MIN_SAMPLES", 5))
+            self.exp4_top_k_per_frame = int(os.environ.get("EXP4_TOP_K_PER_FRAME", 2))
+            self.exp4_max_crops = int(os.environ.get("EXP4_MAX_CROPS", 24))
+            self.exp4_use_rgb = os.environ.get("EXP4_USE_RGB", "0") == "1"
+            # Crop selection: "area" (per-frame top-k by bbox) or "angular" (per-cluster
+            # azimuth-diverse views -- cuts multi-view redundancy).
+            self.exp4_view_select = os.environ.get("EXP4_VIEW_SELECT", "area")
+            self.exp4_n_views = int(os.environ.get("EXP4_N_VIEWS", 3))
+            self.exp4_cache_dir = os.environ.get("EXP4_CACHE_DIR", "data/exp4_cache")
+            os.makedirs(self.exp4_cache_dir, exist_ok=True)
+            print(f"[exp4] enabled: voxel={self.exp4_voxel_size} eps={self.exp4_eps} "
+                  f"top_k/frame={self.exp4_top_k_per_frame} max_crops={self.exp4_max_crops} "
+                  f"view_select={self.exp4_view_select} n_views={self.exp4_n_views} "
+                  f"use_rgb={self.exp4_use_rgb} cache={self.exp4_cache_dir}", flush=True)
         self.scene = {}
         print('============frame sampling strategy: {}============='.format(self.frame_sampling_strategy))
 
@@ -118,7 +140,9 @@ class VideoProcessor:
                 self.scan2obj.update(data)
 
 
-        if 'mc' in self.frame_sampling_strategy:
+        # Load max-coverage sampling tables when mc is the base strategy OR when the
+        # randomized LoRA recipe may pick 'mc' per sample (so both paths are available).
+        if 'mc' in self.frame_sampling_strategy or os.environ.get("LORA_RAND_AUG", "0") == "1":
             sampling_file = "data/metadata/scannet_select_frames.json"
             self.mc_sampling_files = {}
             with open(sampling_file) as f:
@@ -251,18 +275,145 @@ class VideoProcessor:
             "poses": poses,
         }
 
+    def load_exp4_inputs(self, video_id, frame_files):
+        """Load full-res depth(m)/RGB/intrinsics/poses for Exp 4 clustering.
+
+        RGB jpgs and depth pngs are different resolutions in ScanNet posed_images
+        (1296x968 vs 640x480), so we resize RGB down to the depth resolution and
+        use depth_cam2img -- this keeps RGB pixels, world_coords, and the bbox
+        projection all in one consistent (depth) image frame.
+        """
+        meta_info = self.scene[video_id]
+        axis_align_matrix = torch.from_numpy(np.array(meta_info['axis_align_matrix'])).float()
+        depth_intrinsic = torch.from_numpy(np.array(meta_info["depth_cam2img"])).float()  # (4,4)
+
+        depths, poses, rgbs = [], [], []
+        for frame_path in frame_files:
+            depth_path = frame_path.replace(".jpg", ".png")
+            with Image.open(depth_path) as depth_img:
+                depth = np.array(depth_img).astype(np.float32)        # (Hd,Wd) mm
+                Hd, Wd = depth.shape
+                depths.append(torch.from_numpy(depth))
+            pose = np.loadtxt(frame_path.replace("jpg", "txt"))
+            poses.append(torch.from_numpy(pose).float())
+            with Image.open(frame_path) as img:
+                rgb = img.convert("RGB").resize((Wd, Hd))             # -> depth res
+                rgbs.append(torch.from_numpy(np.array(rgb)))          # (Hd,Wd,3) uint8
+
+        depths = torch.stack(depths)                                  # (V,Hd,Wd) mm
+        poses = torch.stack([axis_align_matrix @ p for p in poses])   # (V,4,4) axis-aligned
+        rgbs = torch.stack(rgbs)                                      # (V,Hd,Wd,3) uint8
+        intr_rep = depth_intrinsic.unsqueeze(0).repeat(len(frame_files), 1, 1)
+        world_coords = unproject(intr_rep, poses, depths)             # (V,Hd,Wd,3); divides mm by 1000
+        return depths / 1000.0, poses, depth_intrinsic[:3, :3], world_coords, rgbs
+
+    def load_exp4_rgb(self, frame_files):
+        """Load just the sampled RGB frames at depth resolution (CPU, worker-safe).
+
+        Used to rebuild crop pixels from cached geometry without touching CUDA.
+        """
+        rgbs = []
+        Hd = Wd = None
+        for frame_path in frame_files:
+            if Hd is None:
+                with Image.open(frame_path.replace(".jpg", ".png")) as d:
+                    Wd, Hd = d.size                       # PIL size is (W, H)
+            with Image.open(frame_path) as img:
+                rgb = img.convert("RGB").resize((Wd, Hd))  # -> depth res
+                rgbs.append(torch.from_numpy(np.array(rgb)))
+        return torch.stack(rgbs)                           # (V,Hd,Wd,3) uint8
+
+    def _exp4_cache_path(self, video_id, frame_files, eff_sampling):
+        import hashlib
+        key_src = (f"{video_id}|{len(frame_files)}|{eff_sampling}"
+                   f"|v{self.exp4_voxel_size}|e{self.exp4_eps}|m{self.exp4_min_samples}"
+                   f"|k{self.exp4_top_k_per_frame}|c{self.exp4_max_crops}|rgb{int(self.exp4_use_rgb)}"
+                   f"|vs{self.exp4_view_select}|nv{self.exp4_n_views}")
+        key = hashlib.md5(key_src.encode()).hexdigest()[:12]
+        # _geo suffix marks the lightweight geometry cache (bboxes + per-patch
+        # coords); pixels are rebuilt on load, so this stays ~50 KB/scene.
+        return os.path.join(self.exp4_cache_dir, f"{video_id.replace('/', '_')}_{key}_geo.pt")
+
+    def ensure_exp4_cache(self, video_id, frame_files, eff_sampling):
+        """Build + save the geometry cache for one (scene, sampling, frames) combo
+        if missing. GPU/main-process only; used by the offline pre-cache pass.
+        Returns True if it built, False if already cached."""
+        cache_path = self._exp4_cache_path(video_id, frame_files, eff_sampling)
+        if os.path.exists(cache_path):
+            return False
+        from llava.exp4 import build_scene_geometry
+        depths_m, poses, intr, world_coords, _ = self.load_exp4_inputs(video_id, frame_files)
+        dev = 'cuda' if torch.cuda.is_available() else 'cpu'
+        geo = build_scene_geometry(
+            depths_m.to(dev), poses, intr, world_coords.to(dev),
+            voxel_size=self.exp4_voxel_size, eps=self.exp4_eps, min_samples=self.exp4_min_samples,
+            use_rgb=self.exp4_use_rgb, top_k_per_frame=self.exp4_top_k_per_frame,
+            max_crops=self.exp4_max_crops,
+            view_select=self.exp4_view_select, n_views_per_cluster=self.exp4_n_views,
+        )
+        geo = {k: geo[k].detach().cpu() for k in ("bboxes", "patch_coords", "patch_valid", "frame_id", "img_shape")}
+        torch.save(geo, cache_path)
+        return True
+
+    def process_exp4(self, video_id, frame_files, image_processor, eff_sampling=None):
+        """Exp 4 crop tokens for one scene.
+
+        Caches only the clustering GEOMETRY (the expensive nvblox+DBSCAN step) and
+        rebuilds the RGB crop pixels on every call (cheap, CPU, DataLoader-worker
+        safe). On a cache miss we run nvblox on CUDA -- which CANNOT happen inside a
+        forked worker, so that path raises a clear error telling you to pre-cache.
+        """
+        from torch.utils.data import get_worker_info
+        from llava.exp4 import build_scene_geometry, assemble_crop_pixels
+        eff_sampling = eff_sampling if eff_sampling is not None else self.frame_sampling_strategy
+        cache_path = self._exp4_cache_path(video_id, frame_files, eff_sampling)
+
+        if os.path.exists(cache_path):
+            geo = torch.load(cache_path, map_location='cpu')
+        else:
+            if get_worker_info() is not None:
+                raise RuntimeError(
+                    f"[exp4] cache miss for {video_id} ({eff_sampling}, {len(frame_files)} frames) "
+                    f"inside a DataLoader worker. nvblox needs CUDA, which can't run in a forked "
+                    f"worker. Pre-cache first (train/lora/exp4_precache.sh) or set DATALOADER_WORKERS=0.")
+            depths_m, poses, intr, world_coords, _ = self.load_exp4_inputs(video_id, frame_files)
+            dev = 'cuda' if torch.cuda.is_available() else 'cpu'
+            geo = build_scene_geometry(
+                depths_m.to(dev), poses, intr, world_coords.to(dev),
+                voxel_size=self.exp4_voxel_size, eps=self.exp4_eps, min_samples=self.exp4_min_samples,
+                use_rgb=self.exp4_use_rgb, top_k_per_frame=self.exp4_top_k_per_frame,
+                max_crops=self.exp4_max_crops,
+                view_select=self.exp4_view_select, n_views_per_cluster=self.exp4_n_views,
+            )
+            geo = {k: geo[k].detach().cpu() for k in ("bboxes", "patch_coords", "patch_valid", "frame_id", "img_shape")}
+            torch.save(geo, cache_path)
+
+        # Rebuild SigLIP-normalized crop pixels from cached geometry (CPU).
+        rgbs = self.load_exp4_rgb(frame_files)
+        pixel_values = assemble_crop_pixels(
+            rgbs, geo["frame_id"], geo["bboxes"],
+            siglip_mean=tuple(image_processor.image_mean), siglip_std=tuple(image_processor.image_std),
+        )
+        return {"pixel_values": pixel_values,
+                "patch_coords": geo["patch_coords"],
+                "patch_valid": geo["patch_valid"]}
+
             
 
     def preprocess(
         self,
-        video_id: str, 
+        video_id: str,
         image_processor,
         force_sample: bool = False,
         frames_upbound: int = 0,
         strategy: str = "center_crop",
+        sampling_override: str = None,
     ):
 
-        if 'mc' in self.frame_sampling_strategy:
+        # Per-call frame-sampling override (used by the randomized LoRA recipe).
+        # Falls back to the processor's configured strategy when not given.
+        eff_sampling = sampling_override if sampling_override is not None else self.frame_sampling_strategy
+        if 'mc' in eff_sampling:
             frame_files = self.sample_frame_files_mc(
                 video_id,
                 frames_upbound=frames_upbound,
@@ -337,17 +488,19 @@ class VideoProcessor:
             "video_size": len(images),
             "boundry": boundry,
             "objects": torch.tensor(self.scan2obj[video_id]),
+            "frame_files": frame_files,
             # "world_coords_norm": resized_coords_norm
         }
 
 
     def process_3d_video(
         self,
-        video_id: str, 
+        video_id: str,
         image_processor,
         force_sample: bool = False,
         frames_upbound: int = 0,
         strategy: str = "center_crop",
+        sampling_override: str = None,
     ):
         video_dict = self.preprocess(
             video_id,
@@ -355,8 +508,16 @@ class VideoProcessor:
             force_sample,
             frames_upbound,
             strategy,
+            sampling_override=sampling_override,
         )
         video_dict["images"] = image_processor.preprocess(video_dict["images"], return_tensors="pt")["pixel_values"]
+        if self.exp4_enabled:
+            eff_sampling = sampling_override if sampling_override is not None else self.frame_sampling_strategy
+            crops = self.process_exp4(video_id, video_dict["frame_files"], image_processor, eff_sampling)
+            video_dict["exp4_pixel_values"] = crops["pixel_values"]   # (N,3,384,384)
+            video_dict["exp4_patch_coords"] = crops["patch_coords"]   # (N,14,14,3)
+            video_dict["exp4_patch_valid"] = crops["patch_valid"]     # (N,14,14)
+        video_dict.pop("frame_files", None)
         return video_dict
 
     
@@ -375,14 +536,22 @@ class VideoProcessor:
 
 def merge_video_dict(video_dict_list):
     new_video_dict = {}
-    new_video_dict['box_input'] = []
+    # Per-sample (variable-shape) keys are kept as lists aligned with the batch so
+    # batch_size > 1 works (object counts and crop counts differ across scenes, and
+    # box_input must stay aligned to its own sample's coord tokens).
+    list_keys = ['objects', 'exp4_pixel_values', 'exp4_patch_coords', 'exp4_patch_valid', 'pe_reduction']
     for k in video_dict_list[0]:
-        if k in ["world_coords", 'images', 'objects', 'poses']:
-            new_video_dict[k] = torch.stack([video_dict[k] for video_dict in video_dict_list])
-        elif k in ['box_input']:
-            for video_dict in video_dict_list:
-                if video_dict[k] is not None:
-                    new_video_dict['box_input'].append(video_dict[k])
-
-    new_video_dict['box_input'] = torch.Tensor(new_video_dict['box_input'])
+        if k in ["world_coords", 'images', 'poses']:
+            new_video_dict[k] = torch.stack([vd[k] for vd in video_dict_list])
+        elif k in list_keys:
+            new_video_dict[k] = [vd[k] for vd in video_dict_list]
+        elif k == 'box_input':
+            # One entry per sample: (1,3) tensor or None (None = no coord token).
+            new_video_dict['box_input'] = [
+                (torch.as_tensor(vd['box_input'], dtype=torch.float32).view(1, 3)
+                 if vd.get('box_input') is not None else None)
+                for vd in video_dict_list
+            ]
+    if 'box_input' not in new_video_dict:
+        new_video_dict['box_input'] = [None] * len(video_dict_list)
     return new_video_dict

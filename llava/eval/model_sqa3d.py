@@ -106,7 +106,7 @@ def _eval_model_impl(questions, args):
             "vocab_size": 151649
         })
 
-    tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name, overwrite_config=config)
+    tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name, overwrite_config=config, attn_implementation="sdpa")
 
     if args.lora_path is not None:
         from transformers import AutoTokenizer
@@ -128,6 +128,7 @@ def _eval_model_impl(questions, args):
         video_folder=args.video_folder,
         annotation_dir=args.embodiedscan_folder,
         frame_sampling_strategy=args.frame_sampling_strategy,
+        world_position_embedding_type=getattr(model.config, "world_position_embedding_type", None),
     )
     
     n_correct = 0
@@ -168,8 +169,12 @@ def _eval_model_impl(questions, args):
         )
         video_dict = merge_video_dict([video_dict])
         image_tensors = video_dict.pop('images').half().to(model.device)
-        for k in video_dict:
-            video_dict[k] = video_dict[k].half().to(model.device)
+        for k in list(video_dict.keys()):
+            v = video_dict[k]
+            if torch.is_tensor(v):
+                video_dict[k] = v.half().to(model.device) if v.is_floating_point() else v.to(model.device)
+            elif isinstance(v, list):
+                video_dict[k] = [x.to(model.device) if torch.is_tensor(x) else x for x in v]
 
         stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
         keywords = [stop_str]

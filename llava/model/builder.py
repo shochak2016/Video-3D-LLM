@@ -77,6 +77,29 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 lora_cfg_pretrained = LlavaGemmaConfig.from_pretrained(model_path)
                 tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
                 model = LlavaGemmaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, attn_implementation=attn_implementation, **kwargs)
+            elif "qwen" in model_name.lower() or "qwen" in str(getattr(lora_cfg_pretrained, "architectures", "")).lower():
+                # Route by config architecture too, since training output dirs
+                # (e.g. "exp4-lora-fast") don't carry "qwen" in the name.
+                from llava.model.language_model.llava_qwen import LlavaQwenConfig, LlavaQwenForCausalLM
+
+                import torch.nn as _nn
+                lora_cfg_pretrained = LlavaQwenConfig.from_pretrained(model_path)
+                # Build at the TRAINED vocab (e.g. 151649, which includes the coord
+                # token at 151648). ignore_mismatched_sizes skips the base model's
+                # differently-sized embed/lm_head; we then materialize those as real
+                # (non-meta) params so non_lora_trainables.bin fills them exactly.
+                if overwrite_config is not None:
+                    for k, v in overwrite_config.items():
+                        setattr(lora_cfg_pretrained, k, v)
+                tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
+                model = LlavaQwenForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, attn_implementation=attn_implementation, ignore_mismatched_sizes=True, **kwargs)
+                _dev = "cuda" if torch.cuda.is_available() else "cpu"
+                _ie = model.get_input_embeddings()
+                if _ie.weight.is_meta:
+                    model.set_input_embeddings(_nn.Embedding(_ie.num_embeddings, _ie.embedding_dim, device=_dev, dtype=model.dtype))
+                _oe = model.get_output_embeddings()
+                if _oe is not None and _oe.weight.is_meta:
+                    model.lm_head = _nn.Linear(_oe.in_features, _oe.out_features, bias=False, device=_dev, dtype=model.dtype)
             else:
                 from llava.model.language_model.llava_llama import LlavaConfig
 
@@ -217,7 +240,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                         model = LlavaQwenMoeForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, attn_implementation=attn_implementation, **kwargs)
 
                 else:
-                    from llava.model.language_model.llava_qwen import LlavaQwenConfig
+                    from llava.model.language_model.llava_qwen import LlavaQwenConfig, LlavaQwenForCausalLM
                     if overwrite_config is not None:
                         llava_cfg = LlavaQwenConfig.from_pretrained(model_path)
                         rank0_print(f"Overwriting config with {overwrite_config}")

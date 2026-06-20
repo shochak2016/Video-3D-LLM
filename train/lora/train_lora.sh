@@ -52,7 +52,8 @@ SAVE_LIMIT="${SAVE_LIMIT:-12}"
 DS_CONFIG="${DS_CONFIG:-scripts/zero2.json}"
 MASTER_PORT="${MASTER_PORT:-43001}"
 
-export python3WARNINGS=ignore
+set -o pipefail   # so a torchrun failure isn't masked by the tee pipe
+export PYTHONWARNINGS="${PYTHONWARNINGS:-ignore}"   # was a no-op typo (python3WARNINGS); mutes torch/transformers warnings
 export TOKENIZERS_PARALLELISM=false
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
@@ -81,6 +82,7 @@ torchrun --nnodes=1 --nproc_per_node=1 --master_port "$MASTER_PORT" \
     --image_grid_pinpoints "(1x1),(1x2),(1x3),(1x4),(1x5),(1x6),(2x2),(2x3),(2x4),(2x5),(2x6),(3x3),(3x4),(3x5),(3x6),(4x4),(4x5),(4x6),(5x5),(5x6),(6x6)" \
     --mm_patch_merge_type spatial_unpad \
     --bf16 True \
+    --attn_implementation "${ATTN_IMPL:-flash_attention_2}" \
     --run_name "$RUN_NAME" \
     --output_dir "./ckpt/$RUN_NAME" \
     --num_train_epochs "$EPOCHS" \
@@ -99,8 +101,8 @@ torchrun --nnodes=1 --nproc_per_node=1 --master_port "$MASTER_PORT" \
     --logging_steps 5 \
     --tf32 True \
     --model_max_length 32768 \
-    --gradient_checkpointing True \
-    --dataloader_num_workers 1 \
+    --gradient_checkpointing "${GRAD_CKPT:-True}" \
+    --dataloader_num_workers "${DATALOADER_WORKERS:-1}" \
     --lazy_preprocess True \
     --dataloader_drop_last True \
     --lora_enable True \
@@ -118,4 +120,6 @@ torchrun --nnodes=1 --nproc_per_node=1 --master_port "$MASTER_PORT" \
     --group_by_task_length True \
     --frame_sampling_strategy "$SAMPLING" \
     --frames_upbound "$NUM_FRAMES" \
-    > "./ckpt/${RUN_NAME}.log" 2>&1
+    --report_to "${REPORT_TO:-none}" \
+    ${EXTRA_ARGS} \
+    2>&1 | tee "./ckpt/${RUN_NAME}.log"

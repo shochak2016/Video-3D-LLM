@@ -138,6 +138,10 @@ class DataArguments:
     embodiedscan_folder: Optional[str] = field(default=None)
     video_folder: Optional[str] = field(default=None)
     video_fps: Optional[int] = field(default=1)
+    # NOTE: world_position_embedding_type is a ModelArguments flag; we mirror it
+    # onto the data_args *instance* after parsing (see main()), not as a field
+    # here -- declaring it in two dataclasses makes HfArgumentParser raise a
+    # conflicting-option error.
     frames_upbound: Optional[int] = field(default=0)
     add_time_instruction: Optional[bool] = field(default=False)
     add_spatial_instruction: Optional[bool] = field(default=False)
@@ -1005,6 +1009,7 @@ class LazySupervisedDataset(Dataset):
             min_xyz_range=getattr(data_args, "min_xyz_range", None),
             max_xyz_range=getattr(data_args, "max_xyz_range", None),
             frame_sampling_strategy=getattr(data_args, "frame_sampling_strategy", "uniform"),
+            world_position_embedding_type=getattr(data_args, "world_position_embedding_type", None),
         )
 
         # Handle multiple JSON files specified in the data_path
@@ -1244,16 +1249,41 @@ class LazySupervisedDataset(Dataset):
             else:
                 box_input = None
 
+            # Exp 4 LoRA randomized augmentation (env-gated). Each axis is an
+            # independent 50/50 coin flip per sample:
+            #   - frame sampling : uniform  <-> mc (max-coverage)
+            #   - frames_upbound : 16       <-> 32
+            #   - PE reduction   : avg      <-> minmax   (encoder stays sin3d)
+            # PE reduction is recorded on video_dict and consumed in the model
+            # forward; sampling/frames feed both the uniform frames and the
+            # Exp 4 crop clustering.
+            rand_aug = os.environ.get("LORA_RAND_AUG", "0") == "1"
+            if rand_aug:
+                # Frame choices are env-driven so the budget can be capped (e.g.
+                # LORA_RAND_FRAMES=16 to drop the costly 32-frame option). Fixing
+                # one frame count also makes uniform tokens stackable -> batch>1.
+                # Each axis is env-configurable; give it a single value to fix it
+                # (e.g. LORA_RAND_SAMPLING=uniform -> uniform-only).
+                _frames_upbound = random.choice([int(x) for x in os.environ.get("LORA_RAND_FRAMES", "16,32").split(",")])
+                _sampling = random.choice(os.environ.get("LORA_RAND_SAMPLING", "uniform,mc").split(","))
+                _reduction = random.choice(os.environ.get("LORA_RAND_REDUCTION", "avg,minmax").split(","))
+            else:
+                _frames_upbound = self.data_args.frames_upbound
+                _sampling = None
+                _reduction = None
+
             try:
                 video_dict = self.video_processor.process_3d_video(
                     video_file,
                     image_processor=self.data_args.image_processor,
                     force_sample=self.data_args.force_sample,
-                    frames_upbound=self.data_args.frames_upbound,
+                    frames_upbound=_frames_upbound,
+                    sampling_override=_sampling,
                 )
                 image = video_dict.pop("images")
                 video_size = video_dict.pop("video_size")
                 video_dict["box_input"] = box_input
+                video_dict["pe_reduction"] = _reduction
 
                 if self.data_args.add_time_instruction:
                     time_instruciton = f"The video lasts for {video_time:.2f} seconds, and {num_frames_to_sample} frames are uniformly sampled from it. These frames are located at {frame_time}.Please answer the following questions related to this video."
@@ -1574,6 +1604,9 @@ def train(attn_implementation=None):
 
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    # Exp 4 lives on the data side (crop building) and the model side (token
+    # assembly); mirror the PE type onto data_args so VideoProcessor sees it.
+    data_args.world_position_embedding_type = model_args.world_position_embedding_type
 
     if training_args.verbose_logging:
         rank0_print(f"Inspecting experiment hyperparameters:\n")

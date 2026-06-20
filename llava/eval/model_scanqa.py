@@ -105,7 +105,7 @@ def _eval_model_impl(questions, args):
             "vocab_size": 151649
         })
 
-    tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name, overwrite_config=config)
+    tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name, overwrite_config=config, attn_implementation="sdpa")
 
     if args.lora_path is not None:
         from transformers import AutoTokenizer
@@ -130,6 +130,9 @@ def _eval_model_impl(questions, args):
         # min_xyz_range=model.config.min_xyz_range,
         # max_xyz_range=model.config.max_xyz_range,
         frame_sampling_strategy=args.frame_sampling_strategy,
+        # Exp 4: build voxel-cluster crops at eval too, else the forward falls
+        # through to the uniform PE path and shape-mismatches on the exp4 config.
+        world_position_embedding_type=getattr(model.config, "world_position_embedding_type", None),
     )
     
     n_correct = 0
@@ -171,8 +174,14 @@ def _eval_model_impl(questions, args):
         )
         video_dict = merge_video_dict([video_dict])
         image_tensors = video_dict.pop('images').half().to(model.device)
-        for k in video_dict:
-            video_dict[k] = video_dict[k].half().to(model.device)
+        for k in list(video_dict.keys()):
+            v = video_dict[k]
+            if torch.is_tensor(v):
+                video_dict[k] = v.half().to(model.device) if v.is_floating_point() else v.to(model.device)
+            elif isinstance(v, list):
+                # exp4 crop tensors / box_input / objects / pe_reduction are per-sample
+                # lists; move tensors to device (keep dtype -- the model casts), pass others through.
+                video_dict[k] = [x.to(model.device) if torch.is_tensor(x) else x for x in v]
 
         stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
         keywords = [stop_str]

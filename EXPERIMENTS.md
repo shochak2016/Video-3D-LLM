@@ -23,9 +23,77 @@
 
 Create nonuniform patches by clustering regions of the same depth/object (RGB), and respecitive positional embeddings. Is not compatible with ViT used here (Sigflip v1).
 
+Because SigLIP v1 needs fixed 384² inputs, we don't feed nonuniform patches to the
+ViT directly. Instead each voxel cluster is projected into the frames it's visible
+in, the cluster's 2D bbox is cropped + resized to 384², and run through SigLIP as a
+normal crop. So a cluster becomes a 14×14 token grid whose **per-patch 3D positional
+embedding** comes from the cluster's own voxels (boundary/background pixels masked
+out, empty patches fall back to the cluster centroid).
+
+**Pipeline** (`llava/exp4.py`):
+1. `cluster_scene` — nvblox TSDF over the scene's depth frames → surface voxels → DBSCAN → `VoxelClusters`.
+2. `compute_crop_geometry` — per (cluster, frame): 2D bbox + per-patch masked world coords (`(14,14,3)`), capped to a crop budget.
+3. `assemble_crop_pixels` — crop + resize RGB at each bbox → SigLIP-normalized `(N,3,384,384)`.
+4. Model (`llava/model/llava_arch.py`, `is_exp4` branch) — encode crops → 2D-pool → add sin3d PE from the per-patch coords → **append as extra "frames"** to the uniform video tokens (augment, not replace).
+
+**How Exp 4 should be configured / run**
+
+It runs on the modernized Blackwell (B200) stack: torch 2.9.1+cu128, `nvblox_torch`
+wheel `v0.0.10` + `nvidia-npp-cu12`, conda env `video3d`. Two scripts:
+
+```bash
+# 1. ONE-TIME: pre-cache the clustering geometry (GPU, single process, ~1h for the
+#    562 ScanQA+Scan2Cap scenes x {uniform,mc} x {16,32 frames}). Writes the small
+#    geometry cache (~50 KB/scene; crop pixels are rebuilt cheaply on CPU at train time).
+bash train/lora/exp4_precache.sh
+
+# 2. TRAIN: randomized-augmentation LoRA, layered on the Exp 4 crop tokens.
+bash train/lora/exp4_rand_train.sh
+#    (tqdm prints to terminal + tees to ckpt/exp4-lora-rand.log; checkpoints every SAVE_STEPS)
+```
+
+Key choices baked into the wrappers (all env-overridable):
+- **PE**: `world_position_embedding_type=exp4-discrete-sin3d`. Encoder is **sinusoidal** (`sin3d`). The sin3d module is built with `n_points=2`: uniform-frame PE feeds 2 points (`minmax`→`[min,max]`, `avg`→`[c,c]`), crop PE feeds `[c,c]`.
+- **Randomized augmentation** (`LORA_RAND_AUG=1`): per sample, independent 50/50 coin flips on
+  - frame sampling `uniform ↔ mc`,
+  - frames `16 ↔ 32`,
+  - PE reduction `avg ↔ minmax` (uniform frames only — crops always use their per-patch coord).
+- **Crop budget**: `EXP4_TOP_K_PER_FRAME=2`, `EXP4_MAX_CROPS=24` (most-covered crops kept). Clustering: `EXP4_VOXEL_SIZE=0.1`, `EXP4_EPS=0.15`, `EXP4_MIN_SAMPLES=5`.
+- **Trainable parts**: full `mm_projector` + LoRA on the decoder (`LORA_R=8`, `LORA_ALPHA=16`), vision tower frozen, sin3d PE is parameter-free. Decoder LoRA is ~free (the full backward is already paid to train the projector at the input) and lets the LLM learn to use the new crop/PE tokens — keep it unless running a deliberate projector-only ablation.
+- **Infra**: `ATTN_IMPL=sdpa` (no flash-attn wheel for sm_100), `DS_CONFIG=scripts/zero2_clientoptim.json` (client torch AdamW, avoids FusedAdam JIT), `LD_LIBRARY_PATH` includes the env's `nvidia/*/lib` (nvblox needs `libnppc.so.12`), `GLOG_minloglevel=2` + `PYTHONWARNINGS=ignore` to mute nvblox/torch log spam.
+- **DataLoader**: after pre-caching, `DATALOADER_WORKERS=4` (crops rebuilt on CPU, no CUDA in workers). Without a pre-cache, nvblox clustering can't run in a forked worker — set `DATALOADER_WORKERS=0` to cluster on the fly in the main process (much slower), or the worker raises a clear "pre-cache first" error.
+
+Cache keys include `(scene, sampling, n_frames, voxel/eps/min_samples, top_k, max_crops)`,
+so changing any clustering/budget knob requires re-running the pre-cache (or it
+rebuilds on the fly).
+
 ### Experiment 5
 
 Positional embeddings of pixel distributions within a patch from centroid, via some combination of NN or sinusoidal
+
+**Possibility — VAE distribution embedding.** Instead of collapsing a patch/cluster to
+one coord (current Exp 4 = masked-mean → sin3d), feed the patch's set of 3D points into
+a small VAE; the latent `z` becomes (part of) the PE, capturing the *shape/spread/orientation*
+of the surface region rather than just its center.
+
+- **Input to the VAE**: the per-patch cluster points (XYZ) — encoder is PointNet-style
+  (per-point MLP + symmetric pool, permutation-invariant); or a local occupancy grid
+  (3D-conv VAE); or just mean+covariance (tiny MLP VAE, Gaussian-only).
+- **PE = `sin3d(centroid) ⊕ VAE_z(distribution)`** — keep the positional anchor (the VAE
+  encodes *shape*, not absolute position), concat the learned distribution latent.
+- **Loss** (doubles as the "new loss function" direction): joint
+  `L = L_LM + λ(L_recon + β·L_KL)` — decoder reconstructs the point set / occupancy from `z`.
+- **Granularity**: per-patch (196 latents/crop, fine-grained) vs. one `z` per cluster
+  (a learned object-shape embedding shared across its tokens).
+- **VAE vs deterministic set-encoder**: the variational latent buys a smooth/regularized
+  space + the ability to *sample* `z` (stochastic PE = built-in augmentation/uncertainty).
+  If sampling isn't needed, a plain set-encoder is simpler and may match it.
+- The data is already there: `_per_patch_coord` already masks each patch to its cluster
+  pixels — that mask yields the point set to summarize. Wire behind `EXP4_PE_MODE` (e.g.
+  `sin3d` | `gaussian` | `vae`) so it A/Bs cleanly against the current sin3d baseline.
+
+Note: unlike the current parameter-free sin3d, this PE is *learned*, so it trains
+(no extra capacity frozen).
 
 ### Current built-in modes (`world_position_embedding_type`)
 
@@ -38,3 +106,22 @@ Composite string, 3 composable axes (llava_arch.py:384-517):
 PE is added to the patch feature. e.g. `sample9_sin3d`, `avg_mlp_discrete`.
 
 ### Benchmarks
+
+#### ScanQA val — Exp 4 (`world_position_embedding_type = exp4-discrete-sin3d`)
+
+Per-patch cluster-masked coord → sin3d PE, crop tokens augment uniform frames.
+Eval: uniform sampling, 16 frames, `EXP4_MAX_CROPS=12`, `top_k=1`, loaded as a merged
+full checkpoint with `sdpa`. Train mix: ScanQA + Scan2Cap (63,180 samples / epoch).
+
+| Run | LoRA | Train data | Eval set | EM | CIDEr | BLEU-1 | BLEU-4 | METEOR | ROUGE |
+|---|---|---|---|---|---|---|---|---|---|
+| `exp4-lora-fast` | r8 (α16) | ~0.38 ep (3000 steps, 24k) | val 50 (seed 42) | 0.28 | 100.9 | 44.9 | ~0\* | 20.8 | 44.5 |
+| `exp4-lora-fast` | r8 (α16) | ~0.38 ep (3000 steps, 24k) | val full (4675) | 0.3005 | 101.35 | 46.80 | 16.07 | 19.90 | 48.96 |
+| `exp4-lora-r16-ep1` | r16 (α32) | 1.0 epoch (7897 steps, 63k) | val full (4675) | 0.3106 | 105.10 | 47.81 | 17.64 | 20.40 | 50.20 |
+
+\* BLEU-4 ≈ 0 on the 50-sample subset is a small-sample artifact (short answers form few 4-grams); on full val BLEU-4 = 16.07. Full-val BLEU-2/3 = 31.29 / 22.71. Inference ~1.07 it/s (~73 min for 4675).
+
+Takeaway: ~0.38 epoch (38% of data) already reaches ~paper-level CIDEr — strong base
+model + LoRA saturates fast, so the full-epoch r16 run is expected to add only a few
+points. Likely larger levers toward/above paper: frames 16→32, eval at paper sampling,
+or the 5-task mix.
