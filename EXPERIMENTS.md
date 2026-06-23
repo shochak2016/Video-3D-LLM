@@ -67,6 +67,23 @@ Cache keys include `(scene, sampling, n_frames, voxel/eps/min_samples, top_k, ma
 so changing any clustering/budget knob requires re-running the pre-cache (or it
 rebuilds on the fly).
 
+**Planned ablations (Exp 4):**
+- **Angular view-coverage selection** (`EXP4_VIEW_SELECT=angular`, `EXP4_N_VIEWS`) — per-cluster
+  azimuth-diverse crop views instead of per-frame top-k by bbox area. Implemented + pre-cached;
+  A/B vs the area baseline pending.
+- **32mc + angular** — coverage-best frames (the ablation showed frame count dominates, 32≈+15 pts
+  over 16) combined with angular cluster views. Pre-cached; ~28 h on 1 GPU (ckpt-on).
+- **RGB-as-tiebreaker clustering** (`EXP4_USE_RGB=1`, sweep `rgb_weight`). Today DBSCAN clusters
+  surface voxels on **XYZ only**; adding per-voxel mean RGB should split spatially-touching but
+  differently-colored objects (book on table, poster on wall). Caveat: appending scaled RGB to the
+  DBSCAN distance is a *local* metric, so it can't distinguish a within-object texture edge from a
+  true object boundary (locally identical: small `dXYZ`, large `dRGB`). A weak `rgb_weight` (~0.01)
+  helps on mostly-uniform surfaces but **over-segments textured/patterned objects** (posters,
+  patterned furniture), and no weight fixes both. Principled version: split a geometric cluster only
+  on a *coherent structural* color boundary (two-stage — geometry first, conservative color split,
+  `EXP4_RGB_MODE=tiebreak`), or cluster on **lifted semantic features** (DINO/SAM voxels) instead of
+  raw color. Cheap first pass: `EXP4_USE_RGB=1`, `rgb_weight≈0.01`.
+
 ### Experiment 5
 
 Positional embeddings of pixel distributions within a patch from centroid, via some combination of NN or sinusoidal
@@ -125,3 +142,19 @@ Takeaway: ~0.38 epoch (38% of data) already reaches ~paper-level CIDEr — stron
 model + LoRA saturates fast, so the full-epoch r16 run is expected to add only a few
 points. Likely larger levers toward/above paper: frames 16→32, eval at paper sampling,
 or the 5-task mix.
+
+#### SQA3D test — Exp 4 (zero-shot transfer)
+
+The `exp4-lora-r16-ep1` model (trained on **ScanQA + Scan2Cap only**, SQA3D held out)
+evaluated on the full SQA3D **test** split (3,519 questions) — i.e. **zero-shot** situated
+QA, no SQA3D in the train mix. Same eval config as ScanQA (uniform/16, `EXP4_MAX_CROPS=12`,
+`top_k=1`, merged checkpoint, `sdpa`). Metric is exact-match answer accuracy per question type.
+
+| Run | LoRA | Setting | all | what | is | how | can | which | others |
+|---|---|---|---|---|---|---|---|---|---|
+| `exp4-lora-r16-ep1` | r16 (α32) | zero-shot | **50.87** | 44.46 | 59.66 | 50.11 | 65.09 | 47.58 | 47.88 |
+
+Takeaway: ~50.9% zero-shot on SQA3D from a model that never trained on it is strong
+(situated reasoning transfers from ScanQA+Scan2Cap). `can`/`is` (yes-no-ish) are highest;
+`what` (open-vocab) lowest, as expected. Training *on* SQA3D (the paper's 5-task protocol)
+is the apples-to-apples next step and should lift this meaningfully.
