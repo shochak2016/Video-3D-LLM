@@ -67,7 +67,50 @@ Cache keys include `(scene, sampling, n_frames, voxel/eps/min_samples, top_k, ma
 so changing any clustering/budget knob requires re-running the pre-cache (or it
 rebuilds on the fly).
 
+**Measured — crop diagnostics (81,779 cached crops):**
+- **Aspect distortion is mostly mild.** Median stretch (max/min side ratio) = **1.33**, mean 1.48;
+  **85% of crops < 1.5**, only **7.6% exceed 2:1**, 2.6% > 3:1. This sits right where NaViT found the
+  aspect-preservation benefit ≈ 0.3% — so **NaFlex is weakly justified** (weeks of work to fix a 7.6%
+  tail). Verdict: skip the vendored NaFlex encoder; at most run the free letterbox A/B to confirm.
+- **43% of crops are the FULL frame (640×480).** Nearly half the crop-token budget is **whole-frame
+  duplicates of the uniform video frames** — zero localization value. Cause: geometry-only DBSCAN
+  merges floor+walls+ceiling (all spatially contiguous at the junctions) into one **room-shell
+  mega-cluster** that spans every frame. This is the **highest-ROI lever** found so far, and it makes
+  angular/coverage selection meaningful (today angular is choosing among views where ~half are
+  whole-frame).
+
 **Planned ablations (Exp 4):**
+- **DBSCAN parameter sweep (reduce the 43% full-frame redundancy).** Sweep `EXP4_EPS`
+  (0.10/0.12/0.15), `EXP4_MIN_SAMPLES` (5/10/15), `EXP4_VOXEL_SIZE` (0.05/0.1) and measure
+  **full-frame-crop fraction + clusters/scene + avg cluster size** on a ~30-scene sample (cluster
+  stats only, **no training** — fast diagnostic). Then precache + train the winner. **Caveat:** the
+  room-shell cluster is *genuinely contiguous geometry* (floor↔wall↔ceiling touch), so eps/min_samples
+  alone **cannot fully split it** — a smaller eps fragments objects before it severs the floor-wall
+  junction. The deeper fixes, if the sweep stalls: add **surface normals** to the clustering features
+  (orientation-aware → floor/wall/ceiling split at junctions, the principled version of the RGB
+  tiebreaker), or **RANSAC plane removal** (strip dominant planes before clustering). Start with the
+  cheap eps/min_samples sweep; escalate to normals only if needed.
+- **Augment vs. replace (full frames + crops → crops-only).** *Current* Exp 4 **augments**: the
+  LLM sees the uniform video frames (`V×196` tokens, `V=16/32`) **plus** the cluster crops
+  (`N×196`, `N≤max_crops`), concatenated (`llava_arch.py:668`, `torch.cat([uf, cf])`). The ablation
+  drops the uniform frames entirely → a **fully object-centric / "clusterized"** representation
+  where the scene *is* the set of cluster crops. Tradeoffs: fewer tokens + cleaner single path, but
+  **loses scene context** — background, floor/walls, empty space, and the layout *between* objects
+  vanish (no whole-frame fallback). That makes the **per-cluster 3D PE load-bearing** (it becomes the
+  *only* carrier of spatial layout) and **view coverage a correctness requirement**, not an
+  optimization. Mitigations to test: a low-res "context cluster" / a few whole-scene frames, vs. a
+  pure object-bag betting that the 3D coords reconstruct layout. This is also the regime where a
+  **NaFlex encoder** (no-stretch, native-aspect crops) would be the *sole* encoder path — see Exp 5.
+  Wire behind `EXP4_DROP_UNIFORM=1`.
+- **Crop fit: stretch vs. letterbox vs. NaFlex** (`EXP4_CROP_FIT = stretch | pad | naflex`). Today
+  crops are **anisotropically stretched** to 384² (aspect distorted). `pad` = letterbox to 384² on
+  the *existing* SigLIP-v1 + mask padded patches (cheap, no new encoder) — isolates "does removing
+  the stretch help?". `naflex` = vendored SigLIP2-NaFlex, native aspect, variable `H_p×W_p` patches
+  (the principled fix; see Exp 5). Lit (NaViT +2.8 ImageNet square→aspect; SigLIP2-NaFlex) says the
+  payoff scales with how non-square the crops are — and the **measured distribution above (85% < 1.5,
+  only 7.6% > 2:1) makes NaFlex weakly justified**. So: run `pad` (free) if curious, but **deprioritize
+  the NaFlex encoder** until/unless the crop distribution changes (e.g. after the DBSCAN sweep splits
+  the room-shell into many small, more aspect-varied object crops).
 - **Angular view-coverage selection** (`EXP4_VIEW_SELECT=angular`, `EXP4_N_VIEWS`) — per-cluster
   azimuth-diverse crop views instead of per-frame top-k by bbox area. Implemented + pre-cached;
   A/B vs the area baseline pending.
