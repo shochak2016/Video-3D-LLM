@@ -80,16 +80,28 @@ rebuilds on the fly).
   whole-frame).
 
 **Planned ablations (Exp 4):**
-- **DBSCAN parameter sweep (reduce the 43% full-frame redundancy).** Sweep `EXP4_EPS`
-  (0.10/0.12/0.15), `EXP4_MIN_SAMPLES` (5/10/15), `EXP4_VOXEL_SIZE` (0.05/0.1) and measure
-  **full-frame-crop fraction + clusters/scene + avg cluster size** on a ~30-scene sample (cluster
-  stats only, **no training** — fast diagnostic). Then precache + train the winner. **Caveat:** the
-  room-shell cluster is *genuinely contiguous geometry* (floor↔wall↔ceiling touch), so eps/min_samples
-  alone **cannot fully split it** — a smaller eps fragments objects before it severs the floor-wall
-  junction. The deeper fixes, if the sweep stalls: add **surface normals** to the clustering features
-  (orientation-aware → floor/wall/ceiling split at junctions, the principled version of the RGB
-  tiebreaker), or **RANSAC plane removal** (strip dominant planes before clustering). Start with the
-  cheap eps/min_samples sweep; escalate to normals only if needed.
+- **DBSCAN parameter sweep — DONE (eps=0.10 fixes the 43% redundancy).** 25-scene cluster-stats
+  sweep (voxel=0.1, top_k=2, max_crops=24), measuring full-frame-crop fraction + useful crops/scene:
+
+  | eps | min_samples | full-frame % | useful crops/scene |
+  |----|----|----|----|
+  | 0.15 | 5 (current) | **42.7%** | 13.0 |
+  | 0.12 | 5 | 20.2% | 19.2 |
+  | **0.10** | **5** | **0.0%** | 19.9 |
+  | 0.15 | 10 | 9.0% | 21.8 |
+  | 0.15 | 15 | 0.0% | 19.3 |
+
+  **The room-shell *is* splittable** (my earlier "contiguous, can't split" caveat was wrong): the
+  floor↔wall junction is a **perpendicular/diagonal adjacency**, so `eps=0.10` (= voxel; face-neighbors
+  only, 0.10 m) **severs the 0.14–0.17 m corner** and breaks the shell into floor/wall/ceiling.
+  `min_samples` works differently (sparse junction voxels drop below density → noise → disconnect).
+  Both **eliminate the redundancy and raise useful object crops ~13→~20/scene.** Adopt **`eps=0.10`**
+  (clean mechanism: keeps same-surface contiguity, breaks perpendicular merges). Nuance: face-only
+  connectivity *could* split an object's perpendicular sub-parts (chair seat vs back), but evidence is
+  mild (crops/scene rose to ~20 not ~100, median obj distortion stable ~1.35). Degenerate combos
+  (eps≤voxel, or min_samples>6) yield 0 clusters — the 6-face-neighbor grid limit. *Next: re-precache
+  at eps=0.10 + retrain; surface-normals / RANSAC plane-removal now unnecessary unless part-splitting
+  hurts.*
 - **Augment vs. replace (full frames + crops → crops-only).** *Current* Exp 4 **augments**: the
   LLM sees the uniform video frames (`V×196` tokens, `V=16/32`) **plus** the cluster crops
   (`N×196`, `N≤max_crops`), concatenated (`llava_arch.py:668`, `torch.cat([uf, cf])`). The ablation
