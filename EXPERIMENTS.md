@@ -124,8 +124,21 @@ rebuilds on the fly).
   the NaFlex encoder** until/unless the crop distribution changes (e.g. after the DBSCAN sweep splits
   the room-shell into many small, more aspect-varied object crops).
 - **Angular view-coverage selection** (`EXP4_VIEW_SELECT=angular`, `EXP4_N_VIEWS`) — per-cluster
-  azimuth-diverse crop views instead of per-frame top-k by bbox area. Implemented + pre-cached;
-  A/B vs the area baseline pending.
+  azimuth-diverse crop views instead of per-frame top-k by bbox area. **Inference A/B (r16,
+  uniform/16, 200 seed-42): angular 96.9 CIDEr vs area 101.2 — angular ~4 worse.** Caveats: model
+  *trained* on area (OOD selection swap), and eps=0.15 means angular shuffles views where ~half are
+  whole-frame. **BUT the A/B is INVALID — it never tested multi-view.** Empirically the current
+  angular selection at `max_crops=12` returns **12 objects × exactly 1 view each, zero multi-angle**:
+  the global `(rank, area)` sort is breadth-first ("every cluster gets its primary before any gets a
+  2nd/3rd"), so with ≥12 clusters/scene the budget is fully consumed by *primary* views and the
+  azimuth-diverse rank-1/2 views never get selected. So "angular" degenerated to "one clearest view
+  of 12 objects" — the opposite of the hypothesis. **Re-open, don't bury.**
+  **Fix (depth-favoring, = the intended algorithm):** order candidates by bbox-area desc; keep an
+  object's clearest view first, then keep additional crops of it *only when a frame sees it from a
+  genuinely new azimuth* (`_ang_dist > THRESH`, ~30°), skipping redundant angles, until `max_crops`.
+  Self-balances breadth vs depth. Cluster IDs are global (scene-level clustering), so per-cluster
+  angular-coverage tracking is trivial. Retest the FIXED selection on eps=0.10 clustering, trained,
+  on ScanQA + **SQA3D** (multi-view should help situated/3D reasoning most).
 - **32mc + angular** — coverage-best frames (the ablation showed frame count dominates, 32≈+15 pts
   over 16) combined with angular cluster views. Pre-cached; ~28 h on 1 GPU (ckpt-on).
 - **RGB-as-tiebreaker clustering** (`EXP4_USE_RGB=1`, sweep `rgb_weight`). Today DBSCAN clusters

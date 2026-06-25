@@ -490,19 +490,22 @@ def compute_crop_geometry(
     top_k_per_frame: Optional[int] = 2,
     view_select: str = "area",     # "area" (per-frame top-k by bbox area) | "angular"
     n_views_per_cluster: int = 3,  # angular: max diverse views kept per cluster
-    max_crops: Optional[int] = None,  # angular: global budget (rank-round-robin across clusters)
+    ang_thresh: float = 0.52,      # angular: min azimuth gap (rad, ~30 deg) for a "new" view
+    max_crops: Optional[int] = None,  # angular: global crop budget (clearest-first greedy)
 ) -> dict:
     """Per-crop bbox + per-patch coords/validity (NO pixels). Cacheable + tiny.
 
     view_select:
       - "area": original -- per frame, keep the top_k largest-bbox clusters. A static
         object is re-cropped from many frames (redundant near-duplicate views).
-      - "angular": per cluster, keep up to n_views_per_cluster views that MAXIMIZE
-        azimuth spread about the object centroid (farthest-point on the viewing
-        circle, seeded by largest bbox), then fill the global max_crops budget
-        round-robin by view-rank (every cluster gets its primary view before any
-        gets a 2nd/3rd). Kills multi-view redundancy, guarantees angular coverage,
-        encoder-agnostic -> carries verbatim to SigLIP2.
+      - "angular": DEPTH-favoring greedy. Walk every (cluster, frame) candidate
+        CLEAREST-FIRST (largest bbox); keep an object's clearest view, then keep
+        additional crops of it ONLY when a frame sees it from a genuinely new azimuth
+        (> ang_thresh about the centroid), skipping redundant near-duplicate angles,
+        capped at n_views_per_cluster, until max_crops. Unlike the old breadth-first
+        rank-round-robin (which spent a tight budget entirely on primaries -> 1 view
+        per object, no real multi-view), this spends the budget on actual multi-angle
+        coverage. Encoder-agnostic -> carries verbatim to SigLIP2.
     """
     V, H, W, _ = world_coords.shape
     device = world_coords.device
@@ -515,7 +518,10 @@ def compute_crop_geometry(
     # ---- choose which (cluster, frame, bbox) crops to keep ----
     selected = []  # list of (cid, v, bbox)
     if view_select == "angular":
-        cand = {cid: [] for cid in cluster_ids}        # cid -> [(v, bbox, area)]
+        # Gather all (cluster, frame) candidates with the camera azimuth about the
+        # cluster centroid, then walk them CLEAREST-FIRST and greedily keep a view only
+        # when it adds a genuinely new angle for its object (depth where the data has it).
+        cand = []  # (area, cid, v, bbox, az)
         for v in range(V):
             for cid in cluster_ids:
                 bbox = clusters.cluster_bbox_2d(cid, poses_c2w[v], intrinsics, (H, W), pad=pad)
@@ -524,33 +530,22 @@ def compute_crop_geometry(
                 x0, y0, x1, y1 = bbox
                 if (x1 - x0) < bbox_min_side or (y1 - y0) < bbox_min_side:
                     continue
-                cand[cid].append((v, bbox, (x1 - x0) * (y1 - y0)))
-        ranked = []  # (rank, area, cid, v, bbox)
-        for cid in cluster_ids:
-            c = cand[cid]
-            if not c:
-                continue
-            cen = centroids[cid]
-            az = []
-            for (v, bbox, area) in c:
-                d = poses_c2w[v][:3, 3].to(cen.device, cen.dtype) - cen   # camera - centroid
-                az.append(float(torch.atan2(d[1], d[0])))                # azimuth (z up, axis-aligned)
-            chosen = [max(range(len(c)), key=lambda i: c[i][2])]         # seed: largest bbox
-            while len(chosen) < min(n_views_per_cluster, len(c)):
-                best_i, best_d = None, -1.0
-                for i in range(len(c)):
-                    if i in chosen:
-                        continue
-                    md = min(_ang_dist(az[i], az[j]) for j in chosen)     # nearest already-chosen angle
-                    if md > best_d:
-                        best_d, best_i = md, i
-                chosen.append(best_i)
-            for rank, i in enumerate(chosen):
-                ranked.append((rank, c[i][2], cid, c[i][0], c[i][1]))
-        ranked.sort(key=lambda r: (r[0], -r[1]))   # all primaries (by area), then secondaries, ...
-        if max_crops is not None:
-            ranked = ranked[:max_crops]
-        selected = [(cid, v, bbox) for (_, _, cid, v, bbox) in ranked]
+                cen = centroids[cid]
+                d = poses_c2w[v][:3, 3].to(cen.device, cen.dtype) - cen  # camera - centroid
+                az = float(torch.atan2(d[1], d[0]))                      # azimuth (z up, axis-aligned)
+                cand.append(((x1 - x0) * (y1 - y0), cid, v, bbox, az))
+        cand.sort(key=lambda r: -r[0])                                   # clearest (largest bbox) first
+        covered = {cid: [] for cid in cluster_ids}                       # cid -> azimuths kept so far
+        for area, cid, v, bbox, az in cand:
+            kept = covered[cid]
+            if len(kept) >= n_views_per_cluster:
+                continue                                                 # object already has enough angles
+            if kept and min(_ang_dist(az, a) for a in kept) <= ang_thresh:
+                continue                                                 # redundant near-duplicate angle
+            kept.append(az)
+            selected.append((cid, v, bbox))
+            if max_crops is not None and len(selected) >= max_crops:
+                break
     else:  # "area"
         for v in range(V):
             frame_crops = []
@@ -596,7 +591,7 @@ def build_scene_geometry(
     depths_m, poses_c2w, intrinsics, world_coords,
     voxel_size=0.1, eps=0.15, min_samples=5, use_rgb=False, rgb_weight=0.05,
     pad=4, bbox_min_side=16, top_k_per_frame=2, max_crops=24,
-    view_select="area", n_views_per_cluster=3,
+    view_select="area", n_views_per_cluster=3, ang_thresh=0.52,
 ) -> dict:
     """Cluster (GPU) -> crop geometry, with a global crop budget. Cacheable."""
     clusters = cluster_scene(
@@ -607,7 +602,7 @@ def build_scene_geometry(
     geo = compute_crop_geometry(world_coords, poses_c2w, intrinsics, clusters,
                                 pad=pad, bbox_min_side=bbox_min_side, top_k_per_frame=top_k_per_frame,
                                 view_select=view_select, n_views_per_cluster=n_views_per_cluster,
-                                max_crops=max_crops)
+                                ang_thresh=ang_thresh, max_crops=max_crops)
     n = geo["bboxes"].shape[0]
     # "angular" already budgets to max_crops by rank inside compute_crop_geometry;
     # only the "area" path needs the coverage-based global cap.

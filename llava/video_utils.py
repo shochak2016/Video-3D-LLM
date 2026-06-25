@@ -113,6 +113,7 @@ class VideoProcessor:
             # azimuth-diverse views -- cuts multi-view redundancy).
             self.exp4_view_select = os.environ.get("EXP4_VIEW_SELECT", "area")
             self.exp4_n_views = int(os.environ.get("EXP4_N_VIEWS", 3))
+            self.exp4_ang_thresh = float(os.environ.get("EXP4_ANG_THRESH", 0.52))  # ~30 deg
             self.exp4_cache_dir = os.environ.get("EXP4_CACHE_DIR", "data/exp4_cache")
             os.makedirs(self.exp4_cache_dir, exist_ok=True)
             print(f"[exp4] enabled: voxel={self.exp4_voxel_size} eps={self.exp4_eps} "
@@ -328,7 +329,8 @@ class VideoProcessor:
         key_src = (f"{video_id}|{len(frame_files)}|{eff_sampling}"
                    f"|v{self.exp4_voxel_size}|e{self.exp4_eps}|m{self.exp4_min_samples}"
                    f"|k{self.exp4_top_k_per_frame}|c{self.exp4_max_crops}|rgb{int(self.exp4_use_rgb)}"
-                   f"|vs{self.exp4_view_select}|nv{self.exp4_n_views}")
+                   f"|vs{self.exp4_view_select}|nv{self.exp4_n_views}"
+                   f"{('|at'+str(self.exp4_ang_thresh)) if self.exp4_view_select=='angular' else ''}")
         key = hashlib.md5(key_src.encode()).hexdigest()[:12]
         # _geo suffix marks the lightweight geometry cache (bboxes + per-patch
         # coords); pixels are rebuilt on load, so this stays ~50 KB/scene.
@@ -350,6 +352,7 @@ class VideoProcessor:
             use_rgb=self.exp4_use_rgb, top_k_per_frame=self.exp4_top_k_per_frame,
             max_crops=self.exp4_max_crops,
             view_select=self.exp4_view_select, n_views_per_cluster=self.exp4_n_views,
+            ang_thresh=self.exp4_ang_thresh,
         )
         geo = {k: geo[k].detach().cpu() for k in ("bboxes", "patch_coords", "patch_valid", "frame_id", "img_shape")}
         torch.save(geo, cache_path)
@@ -384,6 +387,7 @@ class VideoProcessor:
                 use_rgb=self.exp4_use_rgb, top_k_per_frame=self.exp4_top_k_per_frame,
                 max_crops=self.exp4_max_crops,
                 view_select=self.exp4_view_select, n_views_per_cluster=self.exp4_n_views,
+                ang_thresh=self.exp4_ang_thresh,
             )
             geo = {k: geo[k].detach().cpu() for k in ("bboxes", "patch_coords", "patch_valid", "frame_id", "img_shape")}
             torch.save(geo, cache_path)
