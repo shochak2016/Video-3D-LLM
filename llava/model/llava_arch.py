@@ -63,6 +63,25 @@ class LlavaMetaModel:
                 self.world_position_embedding = PositionEmbeddingSine3D(config.hidden_size, n_points=n_points)
             # elif "slp" in self.config.world_position_embedding_type:
             #     self.world_position_embedding = PositionEmbeddingSine3DMLP(config.hidden_size, n_points=n_points)
+
+        # exp7: fuse frozen DINOv3 patch features in place of 3D PE. Both variants
+        # degenerate-at-init to "base minus PE", then train with full Adam while the LLM
+        # gets LoRA and both vision encoders stay frozen.
+        if getattr(self.config, "spatial_feature_type", None) and "dinov3" in self.config.spatial_feature_type:
+            dino_dim = getattr(self.config, "dino_feature_dim", 768)
+            h = config.hidden_size
+            # both variants are residual with final layer zero-init -> at step 0 the added
+            # term is exactly 0 (fused == siglip == base minus PE). The only difference is
+            # the MLP input: concat sees BOTH siglip+dino (can modulate siglip by dino),
+            # add sees only dino.
+            in_dim = (h + dino_dim) if "concat" in self.config.spatial_feature_type else dino_dim
+            self.dino_fusion = nn.Sequential(
+                nn.Linear(in_dim, h),
+                nn.GELU(),
+                nn.Linear(h, h),
+            )
+            nn.init.zeros_(self.dino_fusion[-1].weight)
+            nn.init.zeros_(self.dino_fusion[-1].bias)
             
 
     def get_vision_tower(self):
@@ -513,6 +532,22 @@ class LlavaMetaForCausalLM(ABC):
                         
 
                     image_feat = image_feat + self.get_model().world_position_embedding(coords.detach())
+                    new_image_features.append(image_feat)
+                image_features = new_image_features
+
+            # exp7: fuse frozen DINOv3 patch features in place of 3D PE.
+            # dino_feats: (B, V, 196, dino_dim), aligned 1:1 with the pooled SigLIP grid.
+            if (getattr(self.config, "spatial_feature_type", None)
+                    and "dinov3" in self.config.spatial_feature_type
+                    and past_key_values is None):
+                dino_feats = video_dict["dino_feats"]
+                fusion = self.get_model().dino_fusion
+                use_concat = "concat" in self.config.spatial_feature_type
+                new_image_features = []
+                for idx, image_feat in enumerate(image_features):
+                    d = dino_feats[idx].to(device=image_feat.device, dtype=image_feat.dtype)
+                    inp = torch.cat([image_feat, d], dim=-1) if use_concat else d
+                    image_feat = image_feat + fusion(inp)   # residual; fusion final layer 0-init
                     new_image_features.append(image_feat)
                 image_features = new_image_features
 

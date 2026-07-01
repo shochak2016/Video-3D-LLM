@@ -1,1 +1,33 @@
+# byte-compiled / caches
 *__pycache__*
+*.pyc
+*.pyo
+
+# virtual environments
+.venv
+.venv310
+.venv*/
+venv/
+env/
+
+# heavy data / model weights / experiment outputs (never commit; LFS-triggering)
+data/
+ckpt/
+checkpoints/
+results/
+logs/
+wandb/
+*.safetensors
+*.pth
+*.pt
+*.bin
+
+# packaging / build
+*.egg-info/
+build/
+dist/
+
+# editor / os
+.DS_Store
+.idea/
+.vscode/

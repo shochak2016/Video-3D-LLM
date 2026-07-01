@@ -322,6 +322,7 @@ class VideoProcessor:
             "video_size": len(images),
             "boundry": boundry,
             "objects": torch.tensor(self.scan2obj[video_id]),
+            "frame_files": frame_files,   # exp7: needed to look up precomputed DINO features
             # "world_coords_norm": resized_coords_norm
         }
 
@@ -358,11 +359,27 @@ class VideoProcessor:
         return xyz.round().int().tolist()
     
 
+def load_dino_feats(dino_feature_dir, scene_id, frame_files):
+    """exp7: load precomputed frozen DINOv3 patch features for the sampled frames.
+
+    Returns (V, 196, dino_dim) aligned 1:1 with `frame_files` order (== the SigLIP
+    frame order). Cache file per scene: <dir>/<scene_id>.pt with
+    {"frame_ids": [int,...], "feats": (N, 196, dim)}.
+    """
+    cache = torch.load(os.path.join(dino_feature_dir, f"{scene_id}.pt"), map_location="cpu")
+    id2feat = {fid: cache["feats"][i] for i, fid in enumerate(cache["frame_ids"])}
+    frame_ids = [int(os.path.basename(fp).split(".")[0]) for fp in frame_files]
+    missing = [fid for fid in frame_ids if fid not in id2feat]
+    if missing:
+        raise KeyError(f"DINO cache {scene_id} missing frame_ids {missing[:5]} (have {len(id2feat)})")
+    return torch.stack([id2feat[fid] for fid in frame_ids]).float()
+
+
 def merge_video_dict(video_dict_list):
     new_video_dict = {}
     new_video_dict['box_input'] = []
     for k in video_dict_list[0]:
-        if k in ["world_coords", 'images', 'objects']:
+        if k in ["world_coords", 'images', 'objects', 'dino_feats']:
             new_video_dict[k] = torch.stack([video_dict[k] for video_dict in video_dict_list])
         elif k in ['box_input']:
             for video_dict in video_dict_list:

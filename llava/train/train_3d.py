@@ -45,7 +45,7 @@ from llava.train.llava_trainer import LLaVATrainer
 from llava import conversation as conversation_lib
 from llava.model import *
 from llava.mm_utils import process_highres_image, process_anyres_image, process_highres_image_crop_split, tokenizer_image_token, resize_and_center_crop
-from llava.video_utils import VideoProcessor, merge_video_dict
+from llava.video_utils import VideoProcessor, merge_video_dict, load_dino_feats
 from llava.utils import rank0_print, process_video_with_pyav, process_video_with_decord
 
 torch.multiprocessing.set_sharing_strategy("file_system")
@@ -117,6 +117,10 @@ class ModelArguments:
     world_position_embedding_type: Optional[str] = field(default=None)
     object_feature_type: Optional[str] = field(default=None)
 
+    # exp7: fuse frozen DINOv3 patch features in place of 3D positional encoding
+    spatial_feature_type: Optional[str] = field(default=None)  # e.g. "dinov3-fuse"
+    dino_feature_dim: Optional[int] = field(default=768)
+
     ground_head_type: Optional[str] = field(default=None)
     ground_head_hidden_size: Optional[int] = field(default=512)
     ground_loss_scale: Optional[int] = field(default=1)
@@ -148,6 +152,9 @@ class DataArguments:
     max_xyz_range: List[float] = field(default_factory=lambda: [15, 15, 5])
 
     frame_sampling_strategy: str = 'uniform' # uniform, mc32, mc24
+
+    # exp7: directory of precomputed DINOv3 features (<dir>/<scene_id>.pt). None -> disabled.
+    dino_feature_dir: Optional[str] = field(default=None)
 
 
 @dataclass
@@ -259,7 +266,7 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
 def find_all_linear_names(model):
     cls = torch.nn.Linear
     lora_module_names = set()
-    multimodal_keywords = ["mm_projector", "vision_tower", "vision_resampler"]
+    multimodal_keywords = ["mm_projector", "vision_tower", "vision_resampler", "dino_fusion"]
     for name, module in model.named_modules():
         if any(mm_keyword in name for mm_keyword in multimodal_keywords):
             continue
@@ -1253,7 +1260,15 @@ class LazySupervisedDataset(Dataset):
                 )
                 image = video_dict.pop("images")
                 video_size = video_dict.pop("video_size")
+                frame_files = video_dict.pop("frame_files")
                 video_dict["box_input"] = box_input
+
+                # exp7: attach precomputed frozen DINOv3 features, aligned to sampled frames
+                if getattr(self.data_args, "dino_feature_dir", None):
+                    scene_id = video_file.split("/")[-1]
+                    video_dict["dino_feats"] = load_dino_feats(
+                        self.data_args.dino_feature_dir, scene_id, frame_files
+                    )
 
                 if self.data_args.add_time_instruction:
                     time_instruciton = f"The video lasts for {video_time:.2f} seconds, and {num_frames_to_sample} frames are uniformly sampled from it. These frames are located at {frame_time}.Please answer the following questions related to this video."
@@ -1425,6 +1440,10 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
     # configs for 3d tasks
     if model_args.object_feature_type is not None:
         overwrite_config["object_feature_type"] = model_args.object_feature_type
+
+    if model_args.spatial_feature_type is not None:
+        overwrite_config["spatial_feature_type"] = model_args.spatial_feature_type
+        overwrite_config["dino_feature_dim"] = model_args.dino_feature_dim
 
     if model_args.world_position_embedding_type is not None:
         overwrite_config["world_position_embedding_type"] = model_args.world_position_embedding_type
@@ -1819,7 +1838,14 @@ def train(attn_implementation=None):
             for name, param in model.named_parameters():
                 if "world_position_embedding" in name:
                     param.requires_grad_(True)
-        
+
+        # exp7: fusion MLP for DINOv3 features trains with full Adam (excluded from LoRA);
+        # fires in both lora and non-lora modes, like world_position_embedding above.
+        if model_args.spatial_feature_type is not None:
+            for name, param in model.named_parameters():
+                if "dino_fusion" in name:
+                    param.requires_grad_(True)
+
         if model_args.ground_head_type is not None:
             if model_args.ground_head_type in ['mlp', 'score', 'infonce']:
                 for name, param in model.named_parameters():

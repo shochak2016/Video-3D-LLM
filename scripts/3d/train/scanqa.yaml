@@ -1,0 +1,3 @@
+datasets:
+  - json_path: data/processed/scanqa_train_llava_style.json
+    sampling_strategy: "all"
