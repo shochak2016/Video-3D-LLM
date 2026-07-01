@@ -9,6 +9,13 @@
 #       --split train --frames_upbound 32 --out_dir /mnt/local/dino_features/dinov3-vitb16
 #   (also --split val for eval)
 
+# --- no experiment tracker; quiet the warning spam (keeps tqdm + loss lines) ---
+export WANDB_DISABLED=true
+export TRANSFORMERS_VERBOSITY=error
+export TOKENIZERS_PARALLELISM=false
+export PYTHONWARNINGS=ignore
+export BITSANDBYTES_NOWELCOME=1
+
 IMAGE_FOLDER="data"
 VIDEO_FOLDER="data"
 DATA_YAML="scripts/3d/train/scanqa.yaml"
@@ -27,6 +34,8 @@ echo "MID_RUN_NAME: ${MID_RUN_NAME}"
 NUM_GPUS=8
 BATCH_SIZE=16
 GRADIENT_ACCUMULATION_STEPS=$((BATCH_SIZE/NUM_GPUS))
+
+mkdir -p ./ckpt
 
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 torchrun --nnodes=1 --nproc_per_node="${NUM_GPUS}" --master_port 43000 \
@@ -85,5 +94,5 @@ torchrun --nnodes=1 --nproc_per_node="${NUM_GPUS}" --master_port 43000 \
     --mm_spatial_pool_stride 2 \
     --frame_sampling_strategy mc \
     --frames_upbound 32 \
-    > "./ckpt/${MID_RUN_NAME}.log" 2>&1
+    --report_to none
 exit 0;

@@ -15,7 +15,7 @@ from llava.conversation import conv_templates, SeparatorStyle
 from llava.model.builder import load_pretrained_model
 from llava.utils import disable_torch_init
 from llava.mm_utils import tokenizer_image_token, get_model_name_from_path, KeywordsStoppingCriteria
-from llava.video_utils import VideoProcessor, merge_video_dict
+from llava.video_utils import VideoProcessor, merge_video_dict, load_dino_feats
 
 from llava.constants import IGNORE_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, IMAGE_TOKEN_INDEX
 from typing import Dict, Optional, Sequence, List
@@ -153,6 +153,13 @@ def eval_model(questions, args):
             force_sample=args.force_sample,
             frames_upbound=args.max_frame_num,
         )
+        # exp7: attach precomputed frozen DINOv3 features, aligned to the sampled frames.
+        frame_files = video_dict.pop("frame_files")
+        if getattr(args, "dino_feature_dir", None):
+            scene_id = video_id.split("/")[-1]
+            video_dict["dino_feats"] = load_dino_feats(
+                args.dino_feature_dir, scene_id, frame_files
+            )
         video_dict = merge_video_dict([video_dict])
         image_tensors = video_dict.pop('images').half().to(model.device)
         for k in video_dict:
@@ -219,6 +226,7 @@ if __name__ == "__main__":
     parser.add_argument("--force_sample", type=bool, default=True)
     parser.add_argument("--overwrite_cfg", type=bool, default=False)
     parser.add_argument("--lora-path", type=str, default=None)
+    parser.add_argument("--dino_feature_dir", type=str, default=None)  # exp7: precomputed DINOv3 cache
     args = parser.parse_args()
 
     # Data
@@ -229,7 +237,7 @@ if __name__ == "__main__":
         print(f"The {args.answer_file} already exists!!!")
         exit()
     
-    ray.init()
+    ray.init(include_dashboard=False)  # dashboard job modules require pydantic>=2; env has v1
     features = []
     for i in range(args.n_gpu):
         features.append(eval_model.remote(questions[i::args.n_gpu], args))

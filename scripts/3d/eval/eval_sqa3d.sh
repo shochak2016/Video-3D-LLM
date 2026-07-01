@@ -3,12 +3,14 @@
 export python3WARNINGS=ignore
 export TOKENIZERS_PARALLELISM=false
 
-CKPT="./ckpt/$1"
+BASE="data/models/LLaVA-Video-7B-Qwen2"   # base model; LoRA adapter applied on top
+LORA="./ckpt/$1"
 ANWSER_FILE="results/sqa3d/$1.jsonl"
-    
+
 
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 llava/eval/model_sqa3d.py \
-    --model-path $CKPT \
+    --model-path $BASE \
+    --lora-path $LORA \
     --video-folder ./data \
     --embodiedscan-folder data/embodiedscan \
     --n_gpu 8 \
@@ -17,6 +19,6 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 llava/eval/model_sqa3d.py \
     --answer-file $ANWSER_FILE \
     --frame_sampling_strategy $2 \
     --max_frame_num $3 \
-    --overwrite_cfg true
+    --dino_feature_dir "$4"
 
 python llava/eval/eval_sqa3d.py --input-file $ANWSER_FILE

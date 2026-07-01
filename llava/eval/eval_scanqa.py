@@ -37,18 +37,30 @@ def main(args):
         if item['pred_response'] in idx2labels[item['sample_id']]:
             n_correct += 1
 
-    cider_score = cider.compute_score(gts, res)
-    bleu_score = bleu.compute_score(gts, res)
-    meteor_score = meteor.compute_score(gts, res)
-    rouge_score = rouge.compute_score(gts, res)
-
+    # Compute each metric defensively so a flaky scorer (e.g. the METEOR Java subprocess)
+    # can't take down the others. EM + CIDEr are the primary ScanQA metrics.
     print(f"count: {len(gts)}")
-    print(f"CIDER: {cider_score[0]*100}")
-    # print(f"BLEU: {bleu_score[0][-1]*100}")
-    print(f"BLEU: {bleu_score[0][0]*100}, {bleu_score[0][1]*100}, {bleu_score[0][2]*100}, {bleu_score[0][3]*100}")
-    print(f"METEOR: {meteor_score[0]*100}")
-    print(f"Rouge: {rouge_score[0]*100}")
     print(f"EM: {n_correct / len(data)}")
+    try:
+        cider_score = cider.compute_score(gts, res)
+        print(f"CIDER: {cider_score[0]*100}")
+    except Exception as e:
+        print(f"CIDER: FAILED ({e})")
+    try:
+        bleu_score = bleu.compute_score(gts, res)
+        print(f"BLEU: {bleu_score[0][0]*100}, {bleu_score[0][1]*100}, {bleu_score[0][2]*100}, {bleu_score[0][3]*100}")
+    except Exception as e:
+        print(f"BLEU: FAILED ({e})")
+    try:
+        rouge_score = rouge.compute_score(gts, res)
+        print(f"Rouge: {rouge_score[0]*100}")
+    except Exception as e:
+        print(f"Rouge: FAILED ({e})")
+    try:
+        meteor_score = meteor.compute_score(gts, res)
+        print(f"METEOR: {meteor_score[0]*100}")
+    except Exception as e:
+        print(f"METEOR: FAILED ({e})")
 
 
 
